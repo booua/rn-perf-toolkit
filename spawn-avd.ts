@@ -306,6 +306,7 @@ async function main() {
       `Created ${successfulCreations.length}/${deviceCount} AVDs successfully!`,
     ),
   );
+  Deno.exit(0);
 }
 
 if (import.meta.main) {
