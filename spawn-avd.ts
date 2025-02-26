@@ -1,13 +1,4 @@
 #!/usr/bin/env -S deno run --allow-run --allow-read --allow-write
-/**
- * create-avds.ts
- *
- * A Deno script that:
- * 1. Reads avd_config.json
- * 2. Installs each unique system image package once (avoiding repeated "Installing..." logs)
- * 3. Creates each AVD (passing --tag/--abi if specified)
- * 4. Customizes config.ini with user-defined fields
- */
 
 import { existsSync } from "https://deno.land/std@0.190.0/fs/mod.ts";
 import * as path from "https://deno.land/std@0.190.0/path/mod.ts";
