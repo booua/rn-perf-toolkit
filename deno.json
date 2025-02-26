@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "create-emulators": "deno run --allow-run --allow-read --allow-write spawn-avd.ts",
+    "measure-rn-perf": "deno run --allow-run --allow-env --allow-read --allow-write measure-rn-performance.ts"
+  }
+}
