@@ -47,14 +47,23 @@ async function runCommand(
     stderr: "piped",
   };
 
-  const proc = new Deno.Command(cmd, { ...defaultOptions, ...options, args });
-  const output = await proc.output();
+  try {
+    const proc = new Deno.Command(cmd, { ...defaultOptions, ...options, args });
+    const output = await proc.output();
 
-  return {
-    success: output.success,
-    stdout: new TextDecoder().decode(output.stdout),
-    stderr: new TextDecoder().decode(output.stderr),
-  };
+    return {
+      success: output.success,
+      stdout: new TextDecoder().decode(output.stdout),
+      stderr: new TextDecoder().decode(output.stderr),
+    };
+  } catch (error) {
+    console.error(`Error executing command '${cmd}': ${error instanceof Error ? error.message : String(error)}`);
+    return {
+      success: false,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 // Check if a device is connected
@@ -92,14 +101,28 @@ async function startTrace(config: Config): Promise<boolean> {
 // Stop atrace and save output
 async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping atrace and collecting trace data...");
-  const { success } = await runCommand("adb", [
+
+  // Use separate commands to stop trace and save output
+  const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
+  if (!stopResult.success) {
+    console.error(`Failed to stop trace: ${stopResult.stderr}`);
+    return false;
+  }
+
+  // Save trace output to file
+  const saveResult = await runCommand("adb", [
     "shell",
-    "atrace --async_stop -o " + config.deviceTracePath
+    `cat /sys/kernel/debug/tracing/trace > ${config.deviceTracePath}`
   ]);
+
+  if (!saveResult.success) {
+    console.error(`Failed to save trace: ${saveResult.stderr}`);
+    return false;
+  }
 
   // Wait for trace to be written
   await new Promise(resolve => setTimeout(resolve, 2000));
-  return success;
+  return true;
 }
 
 // Launch app and measure startup time
