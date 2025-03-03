@@ -81,6 +81,7 @@ async function startTrace(config: Config): Promise<boolean> {
     "shell",
     "atrace",
     "--async_start",
+    "-b", "16000",
     "-t", config.traceDuration.toString(),
     "-a", config.appPackage,
     ...config.traceCategories
@@ -93,7 +94,7 @@ async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping atrace and collecting trace data...");
   const { success } = await runCommand("adb", [
     "shell",
-    `atrace --async_stop > ${config.deviceTracePath}`
+    "atrace --async_stop -o " + config.deviceTracePath
   ]);
 
   // Wait for trace to be written
@@ -174,15 +175,15 @@ async function processTraceData(
   const metrics: Record<string, number> = {};
 
   // Extract app start timestamp
-  const appStartMatch = traceContent.match(/([0-9.]+) ActivityManager: START.*?${config.appPackage}/);
+  const appStartMatch = traceContent.match(/([0-9.]+).*ActivityManager.*START.*?${config.appPackage}/);
   const appStartTimestamp = appStartMatch ? parseFloat(appStartMatch[1]) : 0;
   metrics.appStartTimestamp = appStartTimestamp;
 
   // Extract activity lifecycle events
-  const createMatch = traceContent.match(/([0-9.]+).*performCreate.*${config.appPackage}/);
-  const startMatch = traceContent.match(/([0-9.]+).*performStart.*${config.appPackage}/);
-  const resumeMatch = traceContent.match(/([0-9.]+).*performResume.*${config.appPackage}/);
-  const drawnMatch = traceContent.match(/([0-9.]+).*reportFullyDrawn.*${config.appPackage}/);
+  const createMatch = traceContent.match(/([0-9.]+).*performCreate.*?${config.appPackage}/);
+  const startMatch = traceContent.match(/([0-9.]+).*performStart.*?${config.appPackage}/);
+  const resumeMatch = traceContent.match(/([0-9.]+).*performResume.*?${config.appPackage}/);
+  const drawnMatch = traceContent.match(/([0-9.]+).*reportFullyDrawn.*?${config.appPackage}/);
 
   if (createMatch) metrics.activityCreateTimestamp = parseFloat(createMatch[1]);
   if (startMatch) metrics.activityStartTimestamp = parseFloat(startMatch[1]);
@@ -191,9 +192,20 @@ async function processTraceData(
 
   // Extract custom markers
   for (const marker of config.customMarkers) {
-    const markerMatch = traceContent.match(new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${marker}`));
-    if (markerMatch) {
-      metrics[`${marker}Timestamp`] = parseFloat(markerMatch[1]);
+    // Try different patterns for custom markers
+    const patterns = [
+      new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${marker}`),
+      new RegExp(`([0-9.]+).*${marker}.*begin`),
+      new RegExp(`([0-9.]+).*begin.*${marker}`),
+      new RegExp(`([0-9.]+).*${marker}`)
+    ];
+
+    for (const pattern of patterns) {
+      const markerMatch = traceContent.match(pattern);
+      if (markerMatch) {
+        metrics[`${marker}Timestamp`] = parseFloat(markerMatch[1]);
+        break;
+      }
     }
   }
 
@@ -444,7 +456,7 @@ async function runTestIteration(iteration: number, config: Config): Promise<bool
 
   // Wait for app to fully initialize
   console.log("Waiting for app to fully initialize...");
-  await new Promise(resolve => setTimeout(resolve, 10000));
+  await new Promise(resolve => setTimeout(resolve, 15000));
 
   // Take screenshot for verification
   if (!await takeScreenshot(screenshotPath)) {
