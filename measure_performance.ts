@@ -86,38 +86,50 @@ async function clearAppData(appPackage: string): Promise<boolean> {
 // Start atrace
 async function startTrace(config: Config): Promise<boolean> {
   console.log("Starting atrace...");
-  const { success } = await runCommand("adb", [
+
+  // Make sure tracing is enabled
+  await runCommand("adb", ["shell", "echo", "1", ">", "/sys/kernel/debug/tracing/tracing_on"]);
+
+  // Start trace with the same parameters as in the shell script
+  const { success, stderr } = await runCommand("adb", [
     "shell",
-    "atrace",
-    "--async_start",
-    "-b", "16000",
-    "-t", config.traceDuration.toString(),
-    "-a", config.appPackage,
-    ...config.traceCategories
+    `atrace --async_start -b 16000 -t ${config.traceDuration} -a ${config.appPackage} ${config.traceCategories.join(" ")}`
   ]);
-  return success;
+
+  if (!success) {
+    console.error(`Failed to start trace: ${stderr}`);
+    return false;
+  }
+
+  return true;
 }
 
 // Stop atrace and save output
 async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping atrace and collecting trace data...");
 
-  // Use separate commands to stop trace and save output
-  const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
-  if (!stopResult.success) {
-    console.error(`Failed to stop trace: ${stopResult.stderr}`);
-    return false;
-  }
-
-  // Save trace output to file
-  const saveResult = await runCommand("adb", [
+  // Use a more direct approach with shell command
+  const { success, stderr } = await runCommand("adb", [
     "shell",
-    `cat /sys/kernel/debug/tracing/trace > ${config.deviceTracePath}`
+    `"atrace --async_stop > ${config.deviceTracePath}"`
   ]);
 
-  if (!saveResult.success) {
-    console.error(`Failed to save trace: ${saveResult.stderr}`);
-    return false;
+  if (!success) {
+    console.error(`Failed to stop trace: ${stderr}`);
+
+    // Try an alternative approach if the first one fails
+    console.log("Trying alternative approach to stop trace...");
+    const altResult = await runCommand("adb", [
+      "shell",
+      "atrace --async_stop",
+      ">",
+      config.deviceTracePath
+    ]);
+
+    if (!altResult.success) {
+      console.error(`Alternative approach also failed: ${altResult.stderr}`);
+      return false;
+    }
   }
 
   // Wait for trace to be written
