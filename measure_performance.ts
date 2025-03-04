@@ -409,36 +409,45 @@ async function writeMetricsToFile(
   config: Config
 ): Promise<void> {
   let content = "===== App Performance Metrics =====\n";
-  content += `Date: ${new Date().toISOString()}\n\n`;
+  content += `Date: ${new Date().toISOString()}\n`;
+  content += `Device: ${(await getDeviceInfo()).model || "Unknown"}\n`;
+  content += `App Package: ${config.appPackage}\n\n`;
+
+  // Define the measurement start line
+  content += "== Measurement Reference Point ==\n";
+  content += "All timing measurements use the Activity Manager START intent as the reference start time (t=0).\n";
+  content += "This is when the system begins the process of starting your application.\n";
+  content += "All relative times are measured from this point.\n\n";
 
   // Android Activity Lifecycle Events
   content += "== Android Activity Lifecycle Events ==\n";
   if (metrics.appStartTimestamp) {
-    content += `Activity start intent time: ${metrics.appStartTimestamp}\n`;
+    content += `Activity start intent time: ${metrics.appStartTimestamp.toFixed(3)} seconds (absolute time)\n`;
+    content += `This is our t=0 reference point for all relative measurements.\n`;
   } else {
     content += "Activity start intent time: Not found in trace\n";
   }
 
   if (metrics.activityCreateTimestamp) {
-    content += `Activity performCreate time: ${metrics.activityCreateTimestamp}\n`;
+    content += `Activity performCreate time: ${metrics.activityCreateTimestamp.toFixed(3)} seconds (absolute time)\n`;
   } else {
     content += "Activity performCreate time: Not found in trace\n";
   }
 
   if (metrics.activityStartTimestamp) {
-    content += `Activity performStart time: ${metrics.activityStartTimestamp}\n`;
+    content += `Activity performStart time: ${metrics.activityStartTimestamp.toFixed(3)} seconds (absolute time)\n`;
   } else {
     content += "Activity performStart time: Not found in trace\n";
   }
 
   if (metrics.activityResumeTimestamp) {
-    content += `Activity performResume time: ${metrics.activityResumeTimestamp}\n`;
+    content += `Activity performResume time: ${metrics.activityResumeTimestamp.toFixed(3)} seconds (absolute time)\n`;
   } else {
     content += "Activity performResume time: Not found in trace\n";
   }
 
   if (metrics.activityDrawnTimestamp) {
-    content += `Activity fully drawn time: ${metrics.activityDrawnTimestamp}\n`;
+    content += `Activity fully drawn time: ${metrics.activityDrawnTimestamp.toFixed(3)} seconds (absolute time)\n`;
   } else {
     content += "Activity fully drawn time: Not found in trace\n";
   }
@@ -446,23 +455,23 @@ async function writeMetricsToFile(
   content += "\n== Startup Performance Metrics ==\n";
 
   if (metrics.timeToCreate) {
-    content += `Time from intent to performCreate: ${metrics.timeToCreate.toFixed(3)}s\n`;
+    content += `Time from intent to performCreate: ${metrics.timeToCreate.toFixed(3)} seconds\n`;
   }
 
   if (metrics.createToStart) {
-    content += `Time from performCreate to performStart: ${metrics.createToStart.toFixed(3)}s\n`;
+    content += `Time from performCreate to performStart: ${metrics.createToStart.toFixed(3)} seconds\n`;
   }
 
   if (metrics.startToResume) {
-    content += `Time from performStart to performResume: ${metrics.startToResume.toFixed(3)}s\n`;
+    content += `Time from performStart to performResume: ${metrics.startToResume.toFixed(3)} seconds\n`;
   }
 
   if (metrics.totalStartupTime) {
-    content += `Total startup time (intent to performResume): ${metrics.totalStartupTime.toFixed(3)}s\n`;
+    content += `Total startup time (intent to performResume): ${metrics.totalStartupTime.toFixed(3)} seconds\n`;
   }
 
   if (metrics.timeToFullyDrawn) {
-    content += `Total time to fully drawn: ${metrics.timeToFullyDrawn.toFixed(3)}s\n`;
+    content += `Total time to fully drawn: ${metrics.timeToFullyDrawn.toFixed(3)} seconds\n`;
   }
 
   content += "\n== Custom Performance Markers ==\n";
@@ -471,12 +480,12 @@ async function writeMetricsToFile(
   for (const marker of config.customMarkers) {
     const markerTimestamp = metrics[`${marker}Timestamp`];
     if (markerTimestamp) {
-      content += `${marker} marker time: ${markerTimestamp}\n`;
+      content += `${marker} marker time: ${markerTimestamp.toFixed(3)} seconds (absolute time)\n`;
 
       // Time from app start to this marker
       const timeToMarker = metrics[`timeTo${marker.charAt(0).toUpperCase() + marker.slice(1)}`];
       if (timeToMarker) {
-        content += `Time from app start to ${marker}: ${timeToMarker.toFixed(3)}s\n`;
+        content += `Time from app start to ${marker}: ${timeToMarker.toFixed(3)} seconds\n`;
       }
     } else {
       content += `${marker} marker: Not found in trace\n`;
@@ -494,7 +503,7 @@ async function writeMetricsToFile(
       const markerToMarker = metrics[`${marker1}To${marker2.charAt(0).toUpperCase() + marker2.slice(1)}`];
 
       if (markerToMarker) {
-        content += `Time from ${marker1} to ${marker2}: ${markerToMarker.toFixed(3)}s\n`;
+        content += `Time from ${marker1} to ${marker2}: ${markerToMarker.toFixed(3)} seconds\n`;
       }
     }
   }
@@ -502,22 +511,22 @@ async function writeMetricsToFile(
   content += "\n== Frame Rendering Performance ==\n";
 
   if (metrics.totalFrames) {
-    content += `Total frames: ${metrics.totalFrames}\n`;
+    content += `Total frames captured: ${metrics.totalFrames}\n`;
 
     if (metrics.avgFrameDuration) {
-      content += `Average frame duration: ${metrics.avgFrameDuration.toFixed(3)}ms\n`;
+      content += `Average frame duration: ${metrics.avgFrameDuration.toFixed(3)} milliseconds\n`;
     }
 
     if (metrics.avgFps) {
-      content += `Average FPS: ${metrics.avgFps.toFixed(1)}\n`;
+      content += `Average FPS: ${metrics.avgFps.toFixed(1)} frames per second\n`;
     }
 
     if (metrics.jankyFrames !== undefined && metrics.jankyFramesPercentage !== undefined) {
-      content += `Janky frames: ${metrics.jankyFrames}/${metrics.totalFrames} (${metrics.jankyFramesPercentage.toFixed(1)}%)\n`;
+      content += `Janky frames (>16.67ms): ${metrics.jankyFrames}/${metrics.totalFrames} (${metrics.jankyFramesPercentage.toFixed(1)}%)\n`;
     }
 
     if (metrics.severeJankyFrames !== undefined && metrics.severeJankyFramesPercentage !== undefined) {
-      content += `Severe janky frames: ${metrics.severeJankyFrames}/${metrics.totalFrames} (${metrics.severeJankyFramesPercentage.toFixed(1)}%)\n`;
+      content += `Severe janky frames (>33.33ms): ${metrics.severeJankyFrames}/${metrics.totalFrames} (${metrics.severeJankyFramesPercentage.toFixed(1)}%)\n`;
     }
   } else {
     content += "No frame data found in trace\n";
@@ -607,6 +616,12 @@ async function generateSummaryReport(config: Config): Promise<void> {
   content += `Device: ${deviceInfo.model || "Unknown"}\n`;
   content += `Android version: ${deviceInfo.androidVersion || "Unknown"}\n\n`;
 
+  // Add measurement reference point explanation
+  content += "== Measurement Reference Point ==\n";
+  content += "All timing measurements use the Activity Manager START intent as the reference start time (t=0).\n";
+  content += "This is when the system begins the process of starting your application.\n";
+  content += "All relative times are measured from this point.\n\n";
+
   // Collect metrics from all iterations
   const allMetrics: Record<string, number[]> = {};
 
@@ -623,24 +638,24 @@ async function generateSummaryReport(config: Config): Promise<void> {
       };
 
       // Extract standard metrics
-      const timeToCreate = extractMetric(/Time from intent to performCreate: ([0-9.]+)s/);
+      const timeToCreate = extractMetric(/Time from intent to performCreate: ([0-9.]+) seconds/);
       if (timeToCreate) addMetric(allMetrics, "timeToCreate", timeToCreate);
 
-      const createToStart = extractMetric(/Time from performCreate to performStart: ([0-9.]+)s/);
+      const createToStart = extractMetric(/Time from performCreate to performStart: ([0-9.]+) seconds/);
       if (createToStart) addMetric(allMetrics, "createToStart", createToStart);
 
-      const startToResume = extractMetric(/Time from performStart to performResume: ([0-9.]+)s/);
+      const startToResume = extractMetric(/Time from performStart to performResume: ([0-9.]+) seconds/);
       if (startToResume) addMetric(allMetrics, "startToResume", startToResume);
 
-      const totalStartupTime = extractMetric(/Total startup time \(intent to performResume\): ([0-9.]+)s/);
+      const totalStartupTime = extractMetric(/Total startup time \(intent to performResume\): ([0-9.]+) seconds/);
       if (totalStartupTime) addMetric(allMetrics, "totalStartupTime", totalStartupTime);
 
-      const timeToFullyDrawn = extractMetric(/Total time to fully drawn: ([0-9.]+)s/);
+      const timeToFullyDrawn = extractMetric(/Total time to fully drawn: ([0-9.]+) seconds/);
       if (timeToFullyDrawn) addMetric(allMetrics, "timeToFullyDrawn", timeToFullyDrawn);
 
       // Extract custom marker metrics
       for (const marker of config.customMarkers) {
-        const timeToMarker = extractMetric(new RegExp(`Time from app start to ${marker}: ([0-9.]+)s`));
+        const timeToMarker = extractMetric(new RegExp(`Time from app start to ${marker}: ([0-9.]+) seconds`));
         if (timeToMarker) addMetric(allMetrics, `timeTo${marker}`, timeToMarker);
       }
 
@@ -650,22 +665,22 @@ async function generateSummaryReport(config: Config): Promise<void> {
           const marker1 = config.customMarkers[i];
           const marker2 = config.customMarkers[j];
 
-          const markerToMarker = extractMetric(new RegExp(`Time from ${marker1} to ${marker2}: ([0-9.]+)s`));
+          const markerToMarker = extractMetric(new RegExp(`Time from ${marker1} to ${marker2}: ([0-9.]+) seconds`));
           if (markerToMarker) addMetric(allMetrics, `${marker1}To${marker2}`, markerToMarker);
         }
       }
 
       // Extract frame metrics
-      const avgFrameDuration = extractMetric(/Average frame duration: ([0-9.]+)ms/);
+      const avgFrameDuration = extractMetric(/Average frame duration: ([0-9.]+) milliseconds/);
       if (avgFrameDuration) addMetric(allMetrics, "avgFrameDuration", avgFrameDuration);
 
-      const avgFps = extractMetric(/Average FPS: ([0-9.]+)/);
+      const avgFps = extractMetric(/Average FPS: ([0-9.]+) frames per second/);
       if (avgFps) addMetric(allMetrics, "avgFps", avgFps);
 
-      const jankyPercentage = extractMetric(/Janky frames: [0-9]+\/[0-9]+ \(([0-9.]+)%\)/);
+      const jankyPercentage = extractMetric(/Janky frames \(>16\.67ms\): [0-9]+\/[0-9]+ \(([0-9.]+)%\)/);
       if (jankyPercentage) addMetric(allMetrics, "jankyPercentage", jankyPercentage);
 
-      const severeJankyPercentage = extractMetric(/Severe janky frames: [0-9]+\/[0-9]+ \(([0-9.]+)%\)/);
+      const severeJankyPercentage = extractMetric(/Severe janky frames \(>33\.33ms\): [0-9]+\/[0-9]+ \(([0-9.]+)%\)/);
       if (severeJankyPercentage) addMetric(allMetrics, "severeJankyPercentage", severeJankyPercentage);
 
     } catch (err) {
@@ -696,10 +711,10 @@ async function generateSummaryReport(config: Config): Promise<void> {
   }
 
   content += "\nFrame rendering performance (averaged over successful runs):\n";
-  addAverageToSummary(content, allMetrics, "avgFrameDuration", "Average frame duration", "ms");
-  addAverageToSummary(content, allMetrics, "avgFps", "Average FPS");
-  addAverageToSummary(content, allMetrics, "jankyPercentage", "Janky frames percentage", "%");
-  addAverageToSummary(content, allMetrics, "severeJankyPercentage", "Severe jank percentage", "%");
+  addAverageToSummary(content, allMetrics, "avgFrameDuration", "Average frame duration", "milliseconds");
+  addAverageToSummary(content, allMetrics, "avgFps", "Average FPS", "frames per second");
+  addAverageToSummary(content, allMetrics, "jankyPercentage", "Janky frames percentage (>16.67ms)", "%");
+  addAverageToSummary(content, allMetrics, "severeJankyPercentage", "Severe jank percentage (>33.33ms)", "%");
 
   await Deno.writeTextFile(summaryFile, content);
   console.log(`Summary report saved to ${summaryFile}`);
@@ -714,12 +729,12 @@ async function generateSummaryReport(config: Config): Promise<void> {
     metrics: Record<string, number[]>,
     metricName: string,
     displayName: string,
-    unit: string = "s"
+    unit: string = "seconds"
   ): string {
     const values = metrics[metricName];
     if (values && values.length > 0) {
       const avg = values.reduce((sum, val) => sum + val, 0) / values.length;
-      content += `- ${displayName}: ${avg.toFixed(3)}${unit} (averaged over ${values.length} runs)\n`;
+      content += `- ${displayName}: ${avg.toFixed(3)} ${unit} (averaged over ${values.length} runs)\n`;
     } else {
       content += `- ${displayName}: No data available\n`;
     }
