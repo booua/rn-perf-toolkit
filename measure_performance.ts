@@ -1,5 +1,8 @@
 #!/usr/bin/env -S deno run --allow-run --allow-read --allow-write --allow-env
 
+import { ensureDir } from "https://deno.land/std/fs/mod.ts";
+import { join } from "https://deno.land/std/path/mod.ts";
+
 interface Config {
   appPackage: string;
   appActivity: string;
@@ -781,7 +784,7 @@ async function main() {
   let customMarkers = markersConfig.customMarkers;
   let pairedMarkers = markersConfig.pairedMarkers;
 
-  let traceCategories = ["gfx", "view", "wm", "am", "input", "sched", "app"];
+  let traceCategories = ["gfx", "view", "wm", "am", "input", "sched", "app", "binder_driver"];
   if (envConfig.TRACE_CATEGORIES) {
     traceCategories = envConfig.TRACE_CATEGORIES.split(",").map(category => category.trim());
   }
