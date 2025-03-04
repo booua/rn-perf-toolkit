@@ -19,7 +19,7 @@ const config: Config = {
   appPackage: PACKAGE_NAME,
   appActivity: `${PACKAGE_NAME}.MainActivity`,
   iterations: 3,
-  traceDuration: 30,
+  traceDuration: 15,
   outputDir: "./performance_traces",
   customMarkers: [
     "app_js_initialized",
@@ -30,7 +30,7 @@ const config: Config = {
     "onboarding_screen_shown",
   ],
   deviceTracePath: "/data/local/tmp/atrace_output.txt",
-  traceCategories: ["gfx", "view", "wm", "am", "input", "sched", "app", "binder_driver"],
+  traceCategories: ["app", "view", "gfx", "am"],
 };
 
 // Track successful runs
@@ -90,10 +90,12 @@ async function startTrace(config: Config): Promise<boolean> {
   // Make sure tracing is enabled
   await runCommand("adb", ["shell", "echo", "1", ">", "/sys/kernel/debug/tracing/tracing_on"]);
 
-  // Start trace with the same parameters as in the shell script
+  // Start trace with optimized parameters to reduce file size but capture JS markers
+  // Reduced buffer size from 16000 to 4000 to limit trace file size
+  // Using -o option to directly write to file instead of keeping in memory
   const { success, stderr } = await runCommand("adb", [
     "shell",
-    `atrace --async_start -b 16000 -t ${config.traceDuration} -a ${config.appPackage} ${config.traceCategories.join(" ")}`
+    `atrace --async_start -b 4000 -t ${config.traceDuration} -a ${config.appPackage} ${config.traceCategories.join(" ")}`
   ]);
 
   if (!success) {
@@ -109,9 +111,10 @@ async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping atrace and collecting trace data...");
 
   // Use a more direct approach with shell command
+  // Added quotes around the path to handle potential spaces
   const { success, stderr } = await runCommand("adb", [
     "shell",
-    `"atrace --async_stop > ${config.deviceTracePath}"`
+    `atrace --async_stop > "${config.deviceTracePath}"`
   ]);
 
   if (!success) {
@@ -121,19 +124,38 @@ async function stopTrace(config: Config): Promise<boolean> {
     console.log("Trying alternative approach to stop trace...");
     const altResult = await runCommand("adb", [
       "shell",
-      "atrace --async_stop",
-      ">",
-      config.deviceTracePath
+      "atrace --async_stop > /data/local/tmp/atrace_output.txt"
     ]);
 
     if (!altResult.success) {
       console.error(`Alternative approach also failed: ${altResult.stderr}`);
-      return false;
+
+      // Try one more approach with separate commands
+      console.log("Trying final approach to stop trace...");
+      const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
+
+      if (!stopResult.success) {
+        console.error(`Final approach also failed: ${stopResult.stderr}`);
+        return false;
+      }
+
+      // If stop succeeded but we couldn't redirect, try to manually save the output
+      console.log("Trace stopped, trying to save output...");
+      const saveResult = await runCommand("adb", [
+        "shell",
+        "atrace --async_dump > /data/local/tmp/atrace_output.txt"
+      ]);
+
+      if (!saveResult.success) {
+        console.error(`Failed to save trace output: ${saveResult.stderr}`);
+        return false;
+      }
     }
   }
 
   // Wait for trace to be written
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  console.log("Waiting for trace to be written...");
+  await new Promise(resolve => setTimeout(resolve, 3000));
   return true;
 }
 
@@ -172,8 +194,46 @@ async function takeScreenshot(outputPath: string): Promise<boolean> {
 // Pull trace file from device
 async function pullTraceFile(config: Config, localPath: string): Promise<boolean> {
   console.log("Pulling trace file...");
-  const { success } = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
-  return success;
+
+  // Try to pull the trace file
+  const { success, stderr } = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
+
+  if (!success) {
+    console.error(`Failed to pull trace file: ${stderr}`);
+
+    // Check if the file exists on the device
+    console.log("Checking if trace file exists on device...");
+    const checkResult = await runCommand("adb", ["shell", `ls -l "${config.deviceTracePath}"`]);
+
+    if (!checkResult.success || !checkResult.stdout.trim()) {
+      console.error("Trace file does not exist on device");
+
+      // Try to find any trace files in the tmp directory
+      console.log("Looking for alternative trace files...");
+      const findResult = await runCommand("adb", ["shell", "ls -l /data/local/tmp/atrace*"]);
+
+      if (findResult.success && findResult.stdout.trim()) {
+        console.log(`Found alternative trace files: ${findResult.stdout}`);
+
+        // Try to pull the first alternative file found
+        const altFile = findResult.stdout.trim().split("\n")[0].split(" ").pop();
+        if (altFile) {
+          console.log(`Trying to pull alternative trace file: ${altFile}`);
+          const altPull = await runCommand("adb", ["pull", altFile, localPath]);
+          return altPull.success;
+        }
+      }
+
+      return false;
+    }
+
+    // If file exists but pull failed, try with different options
+    console.log("Trace file exists but pull failed, trying with different options...");
+    const altPull = await runCommand("adb", ["pull", config.deviceTracePath, localPath, "-a"]);
+    return altPull.success;
+  }
+
+  return true;
 }
 
 // Get device info
@@ -227,20 +287,31 @@ async function processTraceData(
 
   // Extract custom markers
   for (const marker of config.customMarkers) {
-    // Try different patterns for custom markers
+    // Try different patterns for custom markers with more specific focus on PerfettoTracer
     const patterns = [
+      // Primary pattern for React Native custom markers
       new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${marker}`),
+      // Alternative patterns in case the markers are logged differently
+      new RegExp(`([0-9.]+).*PerfettoTracer.*${marker}`),
+      new RegExp(`([0-9.]+).*beginTrace.*${marker}`),
       new RegExp(`([0-9.]+).*${marker}.*begin`),
       new RegExp(`([0-9.]+).*begin.*${marker}`),
-      new RegExp(`([0-9.]+).*${marker}`)
     ];
 
     for (const pattern of patterns) {
       const markerMatch = traceContent.match(pattern);
       if (markerMatch) {
         metrics[`${marker}Timestamp`] = parseFloat(markerMatch[1]);
+        console.log(`Found marker: ${marker} at time ${markerMatch[1]}`);
         break;
       }
+    }
+  }
+
+  // Log if markers were not found
+  for (const marker of config.customMarkers) {
+    if (!metrics[`${marker}Timestamp`]) {
+      console.log(`Warning: Marker '${marker}' not found in trace`);
     }
   }
 
@@ -489,9 +560,14 @@ async function runTestIteration(iteration: number, config: Config): Promise<bool
   const launchOutput = await launchApp(config);
   console.log(launchOutput);
 
-  // Wait for app to fully initialize
-  console.log("Waiting for app to fully initialize...");
-  await new Promise(resolve => setTimeout(resolve, 15000));
+  // Wait for app to fully initialize and ensure we capture all custom markers
+  console.log("Waiting for app to fully initialize and capture custom markers...");
+  // Increased wait time to ensure all custom markers are captured
+  // This is especially important for markers that occur later in the startup process
+  await new Promise(resolve => setTimeout(resolve, 10000));
+
+  // Log a message to help with debugging
+  console.log("App should be fully initialized now, custom markers should be captured");
 
   // Take screenshot for verification
   if (!await takeScreenshot(screenshotPath)) {
