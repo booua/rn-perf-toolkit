@@ -81,48 +81,58 @@ async function startTrace(config: Config): Promise<boolean> {
 async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping atrace and collecting trace data...");
 
+  // Stop the trace
   const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
   if (!stopResult.success) {
     console.error(`Failed to stop trace: ${stopResult.stderr}`);
     return false;
   }
 
-  console.log("Trace stopped, saving output to file...");
+  console.log("Trace stopped, dumping trace data...");
 
   try {
-    const dumpResult = await runCommand("adb", ["shell", `atrace --async_dump > "${config.deviceTracePath}"`]);
+    // Dump the trace directly to a file on the device with a larger buffer size
+    const dumpResult = await runCommand("adb", ["shell", `atrace --async_dump -b 32768 > "${config.deviceTracePath}"`]);
 
     if (!dumpResult.success) {
-      console.error(`Failed to save trace output: ${dumpResult.stderr}`);
+      console.error(`Failed to dump trace: ${dumpResult.stderr}`);
 
-      console.log("Trying alternative approach to save trace...");
-      const altDumpResult = await runCommand("adb", ["shell", "atrace --async_dump > /data/local/tmp/atrace_output.txt"]);
+      // Try an alternative approach - dump to stdout and redirect to file
+      console.log("Trying alternative approach - dumping trace to stdout...");
+      const altDumpResult = await runCommand("adb", ["shell", "atrace", "--async_dump", "-b", "32768"]);
 
-      if (!altDumpResult.success) {
-        console.error(`Alternative approach also failed: ${altDumpResult.stderr}`);
+      if (altDumpResult.success && altDumpResult.stdout) {
+        console.log("Got trace data, writing to file on device...");
+        // Write the trace data to a file on the device
+        const tempFile = "/data/local/tmp/trace_data.txt";
+        const writeResult = await runCommand("adb", ["shell", `echo '${altDumpResult.stdout.replace(/'/g, "'\\''")}' > ${tempFile}`]);
 
-        console.log("Trying final approach to save trace...");
-        const finalDumpResult = await runCommand("adb", ["shell", "atrace", "--async_dump"]);
-
-        if (finalDumpResult.success) {
-          console.log("Got trace data, saving to device...");
-          const saveResult = await runCommand("adb", ["shell", `echo '${finalDumpResult.stdout}' > "${config.deviceTracePath}"`]);
-
-          if (!saveResult.success) {
-            console.error(`Failed to save trace data: ${saveResult.stderr}`);
-            return false;
-          }
+        if (writeResult.success) {
+          console.log(`Trace data written to ${tempFile}`);
+          config.deviceTracePath = tempFile;
         } else {
-          console.error(`Final approach also failed: ${finalDumpResult.stderr}`);
+          console.error(`Failed to write trace data: ${writeResult.stderr}`);
           return false;
         }
       } else {
-        config.deviceTracePath = "/data/local/tmp/atrace_output.txt";
+        console.error(`Failed to get trace data: ${altDumpResult.stderr}`);
+
+        // Last resort - try dumping with a different approach
+        console.log("Trying final approach - dumping trace with cat...");
+        const finalDumpResult = await runCommand("adb", ["shell", `cat /sys/kernel/debug/tracing/trace > /data/local/tmp/trace_final.txt`]);
+
+        if (finalDumpResult.success) {
+          console.log("Final approach succeeded");
+          config.deviceTracePath = "/data/local/tmp/trace_final.txt";
+        } else {
+          console.error(`Final approach failed: ${finalDumpResult.stderr}`);
+          return false;
+        }
       }
     }
 
     console.log("Waiting for trace to be written...");
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     return true;
   } catch (error) {
@@ -158,42 +168,104 @@ async function takeScreenshot(outputPath: string): Promise<boolean> {
   return true;
 }
 async function pullTraceFile(config: Config, localPath: string): Promise<boolean> {
-  console.log("Pulling trace file...");
+  console.log(`Pulling trace file from ${config.deviceTracePath}...`);
 
-  const { success, stderr } = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
+  // First check if the trace file exists and has content
+  const checkResult = await runCommand("adb", ["shell", `ls -l "${config.deviceTracePath}"`]);
 
-  if (!success) {
-    console.error(`Failed to pull trace file: ${stderr}`);
+  if (!checkResult.success || !checkResult.stdout.trim()) {
+    console.error("Trace file does not exist or is empty on device");
 
-    console.log("Checking if trace file exists on device...");
-    const checkResult = await runCommand("adb", ["shell", `ls -l "${config.deviceTracePath}"`]);
+    // Look for alternative trace files
+    console.log("Looking for alternative trace files...");
+    const findResult = await runCommand("adb", ["shell", "ls -l /data/local/tmp/atrace*"]);
 
-    if (!checkResult.success || !checkResult.stdout.trim()) {
-      console.error("Trace file does not exist on device");
+    if (findResult.success && findResult.stdout.trim()) {
+      console.log(`Found alternative trace files: ${findResult.stdout}`);
 
-      console.log("Looking for alternative trace files...");
-      const findResult = await runCommand("adb", ["shell", "ls -l /data/local/tmp/atrace*"]);
+      // Get the most recent or largest trace file
+      const altFiles = findResult.stdout.trim().split("\n");
+      let bestAltFile = "";
+      let largestSize = 0;
 
-      if (findResult.success && findResult.stdout.trim()) {
-        console.log(`Found alternative trace files: ${findResult.stdout}`);
+      for (const fileLine of altFiles) {
+        const parts = fileLine.trim().split(/\s+/);
+        if (parts.length >= 5) {
+          const size = parseInt(parts[4], 10);
+          const path = parts[parts.length - 1];
 
-        const altFile = findResult.stdout.trim().split("\n")[0].split(" ").pop();
-        if (altFile) {
-          console.log(`Trying to pull alternative trace file: ${altFile}`);
-          const altPull = await runCommand("adb", ["pull", altFile, localPath]);
-          return altPull.success;
+          if (size > largestSize) {
+            largestSize = size;
+            bestAltFile = path;
+          }
         }
       }
 
+      if (bestAltFile) {
+        console.log(`Trying to pull alternative trace file: ${bestAltFile} (${largestSize} bytes)`);
+        config.deviceTracePath = bestAltFile;
+      } else {
+        console.error("Could not find a suitable alternative trace file");
+        return false;
+      }
+    } else {
+      console.error("No alternative trace files found");
       return false;
     }
+  } else {
+    // Check file size
+    const sizeCheck = await runCommand("adb", ["shell", `stat -c %s "${config.deviceTracePath}"`]);
+    if (sizeCheck.success) {
+      const size = parseInt(sizeCheck.stdout.trim(), 10);
+      console.log(`Trace file size: ${size} bytes`);
 
-    console.log("Trace file exists but pull failed, trying with different options...");
-    const altPull = await runCommand("adb", ["pull", config.deviceTracePath, localPath, "-a"]);
-    return altPull.success;
+      if (size < 1000) {
+        console.warn("Warning: Trace file is very small, may not contain valid data");
+      }
+    }
   }
 
-  return true;
+  // Try to pull the file
+  console.log(`Pulling trace file from ${config.deviceTracePath} to ${localPath}...`);
+  const pullResult = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
+
+  if (!pullResult.success) {
+    console.error(`Failed to pull trace file: ${pullResult.stderr}`);
+
+    // Try an alternative approach - cat the file and redirect to local file
+    console.log("Trying alternative approach - using cat to retrieve file content...");
+    const catResult = await runCommand("adb", ["shell", `cat "${config.deviceTracePath}"`]);
+
+    if (catResult.success && catResult.stdout) {
+      console.log(`Retrieved ${catResult.stdout.length} bytes of trace data, writing to local file...`);
+      try {
+        await Deno.writeTextFile(localPath, catResult.stdout);
+        console.log("Successfully wrote trace data to local file");
+        return true;
+      } catch (error) {
+        console.error(`Failed to write trace data to local file: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    } else {
+      console.error("Failed to retrieve trace data using cat");
+      return false;
+    }
+  }
+
+  // Verify the pulled file
+  try {
+    const fileInfo = await Deno.stat(localPath);
+    console.log(`Successfully pulled trace file (${fileInfo.size} bytes)`);
+
+    if (fileInfo.size < 1000) {
+      console.warn("Warning: Pulled trace file is very small, may not contain valid data");
+    }
+
+    return fileInfo.size > 0;
+  } catch (error) {
+    console.error(`Error verifying pulled file: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 async function getDeviceInfo(): Promise<Record<string, string>> {
   const info: Record<string, string> = {};
