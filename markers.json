@@ -1,0 +1,26 @@
+{
+  "customMarkers": [
+    "TEST_EVENT_MANUAL",
+    "app_js_initialized",
+    "first_screen_mounted",
+    "js_bundle_load_start",
+    "js_bundle_load_end"
+  ],
+  "pairedMarkers": [
+    {
+      "start": "trace_screen_start",
+      "end": "trace_screen_end",
+      "name": "screen_transition"
+    },
+    {
+      "start": "trace_api_call_start",
+      "end": "trace_api_call_end",
+      "name": "api_call"
+    },
+    {
+      "start": "trace_render_start",
+      "end": "trace_render_end",
+      "name": "component_render"
+    }
+  ]
+}

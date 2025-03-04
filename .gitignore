@@ -1,3 +1,4 @@
 performance_traces/*
 .DS_Store
 *.sh
+.env*
