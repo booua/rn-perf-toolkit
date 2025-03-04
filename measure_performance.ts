@@ -11,6 +11,7 @@ interface Config {
   traceDuration: number;
   outputDir: string;
   customMarkers: string[];
+  pairedMarkers: { start: string; end: string; name: string }[];
   deviceTracePath: string;
   traceCategories: string[];
 }
@@ -19,18 +20,15 @@ const config: Config = {
   appPackage: PACKAGE_NAME,
   appActivity: `${PACKAGE_NAME}.MainActivity`,
   iterations: 3,
-  traceDuration: 15,
+  traceDuration: 30,
   outputDir: "./performance_traces",
-  customMarkers: [
-    "app_js_initialized",
-    "first_screen_mounted",
-    "TEST_EVENT_MANUAL",
-    "home_feed_loaded",
-    "splash_screen_dismissed",
-    "onboarding_screen_shown",
+  customMarkers: ["TEST_EVENT_MANUAL", "app_js_initialized", "first_screen_mounted"],
+  pairedMarkers: [
+    { start: "trace_watchlist_tap_start", end: "trace_watchlist_fully_loaded_end", name: "watchlist_load" },
+    { start: "trace_article_tap_start", end: "trace_article_fully_loaded_end", name: "article_load" }
   ],
   deviceTracePath: "/data/local/tmp/atrace_output.txt",
-  traceCategories: ["app", "view", "gfx", "am"],
+  traceCategories: ["gfx", "view", "wm", "am", "input", "sched", "app"]
 };
 
 // Track successful runs
@@ -110,53 +108,62 @@ async function startTrace(config: Config): Promise<boolean> {
 async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping atrace and collecting trace data...");
 
-  // Use a more direct approach with shell command
-  // Added quotes around the path to handle potential spaces
-  const { success, stderr } = await runCommand("adb", [
-    "shell",
-    `atrace --async_stop > "${config.deviceTracePath}"`
-  ]);
-
-  if (!success) {
-    console.error(`Failed to stop trace: ${stderr}`);
-
-    // Try an alternative approach if the first one fails
-    console.log("Trying alternative approach to stop trace...");
-    const altResult = await runCommand("adb", [
-      "shell",
-      "atrace --async_stop > /data/local/tmp/atrace_output.txt"
-    ]);
-
-    if (!altResult.success) {
-      console.error(`Alternative approach also failed: ${altResult.stderr}`);
-
-      // Try one more approach with separate commands
-      console.log("Trying final approach to stop trace...");
-      const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
-
-      if (!stopResult.success) {
-        console.error(`Final approach also failed: ${stopResult.stderr}`);
-        return false;
-      }
-
-      // If stop succeeded but we couldn't redirect, try to manually save the output
-      console.log("Trace stopped, trying to save output...");
-      const saveResult = await runCommand("adb", [
-        "shell",
-        "atrace --async_dump > /data/local/tmp/atrace_output.txt"
-      ]);
-
-      if (!saveResult.success) {
-        console.error(`Failed to save trace output: ${saveResult.stderr}`);
-        return false;
-      }
-    }
+  // First, stop the trace
+  const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
+  if (!stopResult.success) {
+    console.error(`Failed to stop trace: ${stopResult.stderr}`);
+    return false;
   }
 
-  // Wait for trace to be written
-  console.log("Waiting for trace to be written...");
-  await new Promise(resolve => setTimeout(resolve, 3000));
-  return true;
+  // Then, dump the trace to a file
+  console.log("Trace stopped, saving output to file...");
+
+  try {
+    // Try to dump the trace directly to the device path
+    const dumpResult = await runCommand("adb", ["shell", `atrace --async_dump > "${config.deviceTracePath}"`]);
+
+    if (!dumpResult.success) {
+      console.error(`Failed to save trace output: ${dumpResult.stderr}`);
+
+      // Try an alternative approach with a simpler path
+      console.log("Trying alternative approach to save trace...");
+      const altDumpResult = await runCommand("adb", ["shell", "atrace --async_dump > /data/local/tmp/atrace_output.txt"]);
+
+      if (!altDumpResult.success) {
+        console.error(`Alternative approach also failed: ${altDumpResult.stderr}`);
+
+        // Try one more approach - capture the output directly and save it
+        console.log("Trying final approach to save trace...");
+        const finalDumpResult = await runCommand("adb", ["shell", "atrace", "--async_dump"]);
+
+        if (finalDumpResult.success) {
+          // If we got the dump, save it to the device
+          console.log("Got trace data, saving to device...");
+          const saveResult = await runCommand("adb", ["shell", `echo '${finalDumpResult.stdout}' > "${config.deviceTracePath}"`]);
+
+          if (!saveResult.success) {
+            console.error(`Failed to save trace data: ${saveResult.stderr}`);
+            return false;
+          }
+        } else {
+          console.error(`Final approach also failed: ${finalDumpResult.stderr}`);
+          return false;
+        }
+      } else {
+        // If the alternative path worked, update the config path
+        config.deviceTracePath = "/data/local/tmp/atrace_output.txt";
+      }
+    }
+
+    // Wait for trace to be written
+    console.log("Waiting for trace to be written...");
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    return true;
+  } catch (error) {
+    console.error(`Error in stopTrace: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 // Launch app and measure startup time
@@ -269,10 +276,14 @@ async function processTraceData(
   // Initialize metrics object
   const metrics: Record<string, number> = {};
 
-  // Extract app start timestamp
+  // Extract app start timestamp - this is our reference point (t=0)
   const appStartMatch = traceContent.match(/([0-9.]+).*ActivityManager.*START.*?${config.appPackage}/);
   const appStartTimestamp = appStartMatch ? parseFloat(appStartMatch[1]) : 0;
   metrics.appStartTimestamp = appStartTimestamp;
+
+  if (!appStartTimestamp) {
+    console.error("Could not find app start timestamp in trace. Metrics will be incomplete.");
+  }
 
   // Extract activity lifecycle events
   const createMatch = traceContent.match(/([0-9.]+).*performCreate.*?${config.appPackage}/);
@@ -285,7 +296,7 @@ async function processTraceData(
   if (resumeMatch) metrics.activityResumeTimestamp = parseFloat(resumeMatch[1]);
   if (drawnMatch) metrics.activityDrawnTimestamp = parseFloat(drawnMatch[1]);
 
-  // Extract custom markers
+  // Extract custom markers with improved patterns
   for (const marker of config.customMarkers) {
     // Try different patterns for custom markers with more specific focus on PerfettoTracer
     const patterns = [
@@ -296,6 +307,11 @@ async function processTraceData(
       new RegExp(`([0-9.]+).*beginTrace.*${marker}`),
       new RegExp(`([0-9.]+).*${marker}.*begin`),
       new RegExp(`([0-9.]+).*begin.*${marker}`),
+      // Additional patterns for TEST_EVENT_MANUAL
+      new RegExp(`([0-9.]+).*TEST_EVENT_MANUAL`),
+      new RegExp(`([0-9.]+).*test_event_manual`),
+      // Look for any trace event with this marker
+      new RegExp(`([0-9.]+).*${marker}`),
     ];
 
     for (const pattern of patterns) {
@@ -308,6 +324,54 @@ async function processTraceData(
     }
   }
 
+  // Process paired markers (start/end pairs)
+  for (const pair of config.pairedMarkers) {
+    // Find start marker
+    const startPatterns = [
+      new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${pair.start}`),
+      new RegExp(`([0-9.]+).*PerfettoTracer.*${pair.start}`),
+      new RegExp(`([0-9.]+).*${pair.start}`),
+    ];
+
+    // Find end marker
+    const endPatterns = [
+      new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${pair.end}`),
+      new RegExp(`([0-9.]+).*PerfettoTracer.*${pair.end}`),
+      new RegExp(`([0-9.]+).*${pair.end}`),
+    ];
+
+    let startTimestamp = 0;
+    let endTimestamp = 0;
+
+    // Find start timestamp
+    for (const pattern of startPatterns) {
+      const match = traceContent.match(pattern);
+      if (match) {
+        startTimestamp = parseFloat(match[1]);
+        metrics[`${pair.start}Timestamp`] = startTimestamp;
+        console.log(`Found start marker: ${pair.start} at time ${startTimestamp}`);
+        break;
+      }
+    }
+
+    // Find end timestamp
+    for (const pattern of endPatterns) {
+      const match = traceContent.match(pattern);
+      if (match) {
+        endTimestamp = parseFloat(match[1]);
+        metrics[`${pair.end}Timestamp`] = endTimestamp;
+        console.log(`Found end marker: ${pair.end} at time ${endTimestamp}`);
+        break;
+      }
+    }
+
+    // Calculate duration if both markers were found
+    if (startTimestamp && endTimestamp) {
+      metrics[`${pair.name}Duration`] = endTimestamp - startTimestamp;
+      console.log(`Duration for ${pair.name}: ${metrics[`${pair.name}Duration`].toFixed(3)}s`);
+    }
+  }
+
   // Log if markers were not found
   for (const marker of config.customMarkers) {
     if (!metrics[`${marker}Timestamp`]) {
@@ -315,11 +379,55 @@ async function processTraceData(
     }
   }
 
-  // Calculate time differences
-  if (appStartTimestamp && metrics.activityCreateTimestamp) {
-    metrics.timeToCreate = metrics.activityCreateTimestamp - appStartTimestamp;
+  for (const pair of config.pairedMarkers) {
+    if (!metrics[`${pair.start}Timestamp`]) {
+      console.log(`Warning: Start marker '${pair.start}' not found in trace`);
+    }
+    if (!metrics[`${pair.end}Timestamp`]) {
+      console.log(`Warning: End marker '${pair.end}' not found in trace`);
+    }
   }
 
+  // Calculate time differences from app start (t=0) to all events
+  if (appStartTimestamp) {
+    // Activity lifecycle events
+    if (metrics.activityCreateTimestamp) {
+      metrics.timeToCreate = metrics.activityCreateTimestamp - appStartTimestamp;
+    }
+    if (metrics.activityStartTimestamp) {
+      metrics.timeToStart = metrics.activityStartTimestamp - appStartTimestamp;
+    }
+    if (metrics.activityResumeTimestamp) {
+      metrics.timeToResume = metrics.activityResumeTimestamp - appStartTimestamp;
+    }
+    if (metrics.activityDrawnTimestamp) {
+      metrics.timeToFullyDrawn = metrics.activityDrawnTimestamp - appStartTimestamp;
+    }
+
+    // Custom markers
+    for (const marker of config.customMarkers) {
+      const markerTimestamp = metrics[`${marker}Timestamp`];
+      if (markerTimestamp) {
+        metrics[`timeTo${marker}`] = markerTimestamp - appStartTimestamp;
+      }
+    }
+
+    // Paired markers
+    for (const pair of config.pairedMarkers) {
+      const startTimestamp = metrics[`${pair.start}Timestamp`];
+      const endTimestamp = metrics[`${pair.end}Timestamp`];
+
+      if (startTimestamp) {
+        metrics[`timeTo${pair.start}`] = startTimestamp - appStartTimestamp;
+      }
+
+      if (endTimestamp) {
+        metrics[`timeTo${pair.end}`] = endTimestamp - appStartTimestamp;
+      }
+    }
+  }
+
+  // Calculate time between lifecycle events
   if (metrics.activityCreateTimestamp && metrics.activityStartTimestamp) {
     metrics.createToStart = metrics.activityStartTimestamp - metrics.activityCreateTimestamp;
   }
@@ -330,70 +438,6 @@ async function processTraceData(
 
   if (appStartTimestamp && metrics.activityResumeTimestamp) {
     metrics.totalStartupTime = metrics.activityResumeTimestamp - appStartTimestamp;
-  }
-
-  if (appStartTimestamp && metrics.activityDrawnTimestamp) {
-    metrics.timeToFullyDrawn = metrics.activityDrawnTimestamp - appStartTimestamp;
-  }
-
-  // Calculate time to custom markers
-  for (const marker of config.customMarkers) {
-    const markerTimestamp = metrics[`${marker}Timestamp`];
-    if (appStartTimestamp && markerTimestamp) {
-      metrics[`timeTo${marker.charAt(0).toUpperCase() + marker.slice(1)}`] =
-        markerTimestamp - appStartTimestamp;
-    }
-  }
-
-  // Calculate time between markers
-  for (let i = 0; i < config.customMarkers.length; i++) {
-    for (let j = i + 1; j < config.customMarkers.length; j++) {
-      const marker1 = config.customMarkers[i];
-      const marker2 = config.customMarkers[j];
-
-      const timestamp1 = metrics[`${marker1}Timestamp`];
-      const timestamp2 = metrics[`${marker2}Timestamp`];
-
-      if (timestamp1 && timestamp2) {
-        metrics[`${marker1}To${marker2.charAt(0).toUpperCase() + marker2.slice(1)}`] =
-          timestamp2 - timestamp1;
-      }
-    }
-  }
-
-  // Extract frame data
-  const frameMatches = traceContent.match(/[0-9.]+.*Choreographer.*doFrame/g) || [];
-  metrics.totalFrames = frameMatches.length;
-
-  if (frameMatches.length > 1) {
-    // Extract timestamps
-    const frameTimestamps = frameMatches.map(match => {
-      const timestamp = match.match(/^([0-9.]+)/);
-      return timestamp ? parseFloat(timestamp[1]) : 0;
-    }).filter(ts => ts > 0);
-
-    // Calculate frame durations
-    const frameDurations: number[] = [];
-    for (let i = 1; i < frameTimestamps.length; i++) {
-      frameDurations.push((frameTimestamps[i] - frameTimestamps[i-1]) * 1000); // Convert to ms
-    }
-
-    if (frameDurations.length > 0) {
-      // Calculate average frame duration and FPS
-      const avgFrameDuration = frameDurations.reduce((sum, duration) => sum + duration, 0) / frameDurations.length;
-      metrics.avgFrameDuration = avgFrameDuration;
-      metrics.avgFps = 1000 / avgFrameDuration;
-
-      // Count janky frames (> 16.67ms, which is less than 60fps)
-      const jankyFrames = frameDurations.filter(duration => duration > 16.67).length;
-      metrics.jankyFrames = jankyFrames;
-      metrics.jankyFramesPercentage = (jankyFrames / frameDurations.length) * 100;
-
-      // Count severe janky frames (> 33.33ms, which is less than 30fps)
-      const severeJankyFrames = frameDurations.filter(duration => duration > 33.33).length;
-      metrics.severeJankyFrames = severeJankyFrames;
-      metrics.severeJankyFramesPercentage = (severeJankyFrames / frameDurations.length) * 100;
-    }
   }
 
   // Write metrics to file
@@ -452,86 +496,112 @@ async function writeMetricsToFile(
     content += "Activity fully drawn time: Not found in trace\n";
   }
 
-  content += "\n== Startup Performance Metrics ==\n";
-
+  content += "\n== Time from App Launch to Activity Lifecycle Events ==\n";
   if (metrics.timeToCreate) {
     content += `Time from intent to performCreate: ${metrics.timeToCreate.toFixed(3)} seconds\n`;
   }
 
-  if (metrics.createToStart) {
-    content += `Time from performCreate to performStart: ${metrics.createToStart.toFixed(3)} seconds\n`;
+  if (metrics.timeToStart) {
+    content += `Time from intent to performStart: ${metrics.timeToStart.toFixed(3)} seconds\n`;
   }
 
-  if (metrics.startToResume) {
-    content += `Time from performStart to performResume: ${metrics.startToResume.toFixed(3)} seconds\n`;
-  }
-
-  if (metrics.totalStartupTime) {
-    content += `Total startup time (intent to performResume): ${metrics.totalStartupTime.toFixed(3)} seconds\n`;
+  if (metrics.timeToResume) {
+    content += `Time from intent to performResume: ${metrics.timeToResume.toFixed(3)} seconds\n`;
   }
 
   if (metrics.timeToFullyDrawn) {
     content += `Total time to fully drawn: ${metrics.timeToFullyDrawn.toFixed(3)} seconds\n`;
   }
 
+  // Custom Markers
   content += "\n== Custom Performance Markers ==\n";
-
-  // Report on all custom markers
   for (const marker of config.customMarkers) {
     const markerTimestamp = metrics[`${marker}Timestamp`];
     if (markerTimestamp) {
       content += `${marker} marker time: ${markerTimestamp.toFixed(3)} seconds (absolute time)\n`;
-
-      // Time from app start to this marker
-      const timeToMarker = metrics[`timeTo${marker.charAt(0).toUpperCase() + marker.slice(1)}`];
-      if (timeToMarker) {
-        content += `Time from app start to ${marker}: ${timeToMarker.toFixed(3)} seconds\n`;
-      }
     } else {
       content += `${marker} marker: Not found in trace\n`;
     }
   }
 
-  content += "\n== Marker-to-Marker Timings ==\n";
-
-  // Report on marker-to-marker timings
-  for (let i = 0; i < config.customMarkers.length; i++) {
-    for (let j = i + 1; j < config.customMarkers.length; j++) {
-      const marker1 = config.customMarkers[i];
-      const marker2 = config.customMarkers[j];
-
-      const markerToMarker = metrics[`${marker1}To${marker2.charAt(0).toUpperCase() + marker2.slice(1)}`];
-
-      if (markerToMarker) {
-        content += `Time from ${marker1} to ${marker2}: ${markerToMarker.toFixed(3)} seconds\n`;
-      }
+  content += "\n== Time from App Launch to Custom Markers ==\n";
+  for (const marker of config.customMarkers) {
+    const timeToMarker = metrics[`timeTo${marker}`];
+    if (timeToMarker) {
+      content += `Time from app start to ${marker}: ${timeToMarker.toFixed(3)} seconds\n`;
     }
   }
 
-  content += "\n== Frame Rendering Performance ==\n";
+  // Paired Markers
+  if (config.pairedMarkers.length > 0) {
+    content += "\n== Paired Markers (Start/End) ==\n";
+    for (const pair of config.pairedMarkers) {
+      const startTimestamp = metrics[`${pair.start}Timestamp`];
+      const endTimestamp = metrics[`${pair.end}Timestamp`];
+      const duration = metrics[`${pair.name}Duration`];
+
+      content += `=== ${pair.name} ===\n`;
+
+      if (startTimestamp) {
+        content += `${pair.start} time: ${startTimestamp.toFixed(3)} seconds (absolute time)\n`;
+
+        const timeToStart = metrics[`timeTo${pair.start}`];
+        if (timeToStart) {
+          content += `Time from app start to ${pair.start}: ${timeToStart.toFixed(3)} seconds\n`;
+        }
+      } else {
+        content += `${pair.start}: Not found in trace\n`;
+      }
+
+      if (endTimestamp) {
+        content += `${pair.end} time: ${endTimestamp.toFixed(3)} seconds (absolute time)\n`;
+
+        const timeToEnd = metrics[`timeTo${pair.end}`];
+        if (timeToEnd) {
+          content += `Time from app start to ${pair.end}: ${timeToEnd.toFixed(3)} seconds\n`;
+        }
+      } else {
+        content += `${pair.end}: Not found in trace\n`;
+      }
+
+      if (duration) {
+        content += `Duration of ${pair.name}: ${duration.toFixed(3)} seconds\n`;
+      } else if (startTimestamp && endTimestamp) {
+        content += `Duration of ${pair.name}: ${(endTimestamp - startTimestamp).toFixed(3)} seconds\n`;
+      } else {
+        content += `Duration of ${pair.name}: Could not be calculated\n`;
+      }
+
+      content += "\n";
+    }
+  }
+
+  // Frame Rendering Performance
+  content += "== Frame Rendering Performance ==\n";
 
   if (metrics.totalFrames) {
     content += `Total frames captured: ${metrics.totalFrames}\n`;
-
-    if (metrics.avgFrameDuration) {
-      content += `Average frame duration: ${metrics.avgFrameDuration.toFixed(3)} milliseconds\n`;
-    }
-
-    if (metrics.avgFps) {
-      content += `Average FPS: ${metrics.avgFps.toFixed(1)} frames per second\n`;
-    }
-
-    if (metrics.jankyFrames !== undefined && metrics.jankyFramesPercentage !== undefined) {
-      content += `Janky frames (>16.67ms): ${metrics.jankyFrames}/${metrics.totalFrames} (${metrics.jankyFramesPercentage.toFixed(1)}%)\n`;
-    }
-
-    if (metrics.severeJankyFrames !== undefined && metrics.severeJankyFramesPercentage !== undefined) {
-      content += `Severe janky frames (>33.33ms): ${metrics.severeJankyFrames}/${metrics.totalFrames} (${metrics.severeJankyFramesPercentage.toFixed(1)}%)\n`;
-    }
   } else {
-    content += "No frame data found in trace\n";
+    content += "Total frames captured: 0\n";
   }
 
+  if (metrics.avgFrameDuration) {
+    content += `Average frame duration: ${metrics.avgFrameDuration.toFixed(2)} ms\n`;
+  }
+
+  if (metrics.avgFps) {
+    content += `Average FPS: ${metrics.avgFps.toFixed(1)}\n`;
+  }
+
+  if (metrics.jankyFrames) {
+    content += `Janky frames (>16.67ms): ${metrics.jankyFrames} (${metrics.jankyFramesPercentage.toFixed(1)}%)\n`;
+  }
+
+  if (metrics.severeJankyFrames) {
+    content += `Severe janky frames (>33.33ms): ${metrics.severeJankyFrames} (${metrics.severeJankyFramesPercentage.toFixed(1)}%)\n`;
+  }
+
+  // Write to file
   await Deno.writeTextFile(metricsFile, content);
   console.log(`Metrics saved to ${metricsFile}`);
 }
@@ -607,123 +677,16 @@ async function runTestIteration(iteration: number, config: Config): Promise<bool
 // Generate summary report
 async function generateSummaryReport(config: Config): Promise<void> {
   console.log("Generating summary report...");
-
   const summaryFile = join(config.outputDir, "summary_report.txt");
-  const deviceInfo = await getDeviceInfo();
-
-  let content = "======== Performance Test Summary ========\n";
-  content += `Date: ${new Date().toISOString()}\n`;
-  content += `Device: ${deviceInfo.model || "Unknown"}\n`;
-  content += `Android version: ${deviceInfo.androidVersion || "Unknown"}\n\n`;
-
-  // Add measurement reference point explanation
-  content += "== Measurement Reference Point ==\n";
-  content += "All timing measurements use the Activity Manager START intent as the reference start time (t=0).\n";
-  content += "This is when the system begins the process of starting your application.\n";
-  content += "All relative times are measured from this point.\n\n";
-
-  // Collect metrics from all iterations
   const allMetrics: Record<string, number[]> = {};
 
-  for (const iteration of successfulRuns) {
-    const metricsFile = join(config.outputDir, `metrics_${iteration}.txt`);
-
-    try {
-      const metricsContent = await Deno.readTextFile(metricsFile);
-
-      // Extract metrics using regex
-      const extractMetric = (pattern: RegExp): number | null => {
-        const match = metricsContent.match(pattern);
-        return match ? parseFloat(match[1]) : null;
-      };
-
-      // Extract standard metrics
-      const timeToCreate = extractMetric(/Time from intent to performCreate: ([0-9.]+) seconds/);
-      if (timeToCreate) addMetric(allMetrics, "timeToCreate", timeToCreate);
-
-      const createToStart = extractMetric(/Time from performCreate to performStart: ([0-9.]+) seconds/);
-      if (createToStart) addMetric(allMetrics, "createToStart", createToStart);
-
-      const startToResume = extractMetric(/Time from performStart to performResume: ([0-9.]+) seconds/);
-      if (startToResume) addMetric(allMetrics, "startToResume", startToResume);
-
-      const totalStartupTime = extractMetric(/Total startup time \(intent to performResume\): ([0-9.]+) seconds/);
-      if (totalStartupTime) addMetric(allMetrics, "totalStartupTime", totalStartupTime);
-
-      const timeToFullyDrawn = extractMetric(/Total time to fully drawn: ([0-9.]+) seconds/);
-      if (timeToFullyDrawn) addMetric(allMetrics, "timeToFullyDrawn", timeToFullyDrawn);
-
-      // Extract custom marker metrics
-      for (const marker of config.customMarkers) {
-        const timeToMarker = extractMetric(new RegExp(`Time from app start to ${marker}: ([0-9.]+) seconds`));
-        if (timeToMarker) addMetric(allMetrics, `timeTo${marker}`, timeToMarker);
-      }
-
-      // Extract marker-to-marker timings
-      for (let i = 0; i < config.customMarkers.length; i++) {
-        for (let j = i + 1; j < config.customMarkers.length; j++) {
-          const marker1 = config.customMarkers[i];
-          const marker2 = config.customMarkers[j];
-
-          const markerToMarker = extractMetric(new RegExp(`Time from ${marker1} to ${marker2}: ([0-9.]+) seconds`));
-          if (markerToMarker) addMetric(allMetrics, `${marker1}To${marker2}`, markerToMarker);
-        }
-      }
-
-      // Extract frame metrics
-      const avgFrameDuration = extractMetric(/Average frame duration: ([0-9.]+) milliseconds/);
-      if (avgFrameDuration) addMetric(allMetrics, "avgFrameDuration", avgFrameDuration);
-
-      const avgFps = extractMetric(/Average FPS: ([0-9.]+) frames per second/);
-      if (avgFps) addMetric(allMetrics, "avgFps", avgFps);
-
-      const jankyPercentage = extractMetric(/Janky frames \(>16\.67ms\): [0-9]+\/[0-9]+ \(([0-9.]+)%\)/);
-      if (jankyPercentage) addMetric(allMetrics, "jankyPercentage", jankyPercentage);
-
-      const severeJankyPercentage = extractMetric(/Severe janky frames \(>33\.33ms\): [0-9]+\/[0-9]+ \(([0-9.]+)%\)/);
-      if (severeJankyPercentage) addMetric(allMetrics, "severeJankyPercentage", severeJankyPercentage);
-
-    } catch (err) {
-      console.error(`Error processing metrics file ${metricsFile}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  // Calculate averages and add to summary
-  content += "App startup performance (averaged over successful runs):\n";
-  addAverageToSummary(content, allMetrics, "timeToCreate", "Time from intent to performCreate");
-  addAverageToSummary(content, allMetrics, "createToStart", "Time from performCreate to performStart");
-  addAverageToSummary(content, allMetrics, "startToResume", "Time from performStart to performResume");
-  addAverageToSummary(content, allMetrics, "totalStartupTime", "Total startup time (intent to performResume)");
-  addAverageToSummary(content, allMetrics, "timeToFullyDrawn", "Total time to fully drawn");
-
-  content += "\nCustom marker timings (averaged over successful runs):\n";
-  for (const marker of config.customMarkers) {
-    addAverageToSummary(content, allMetrics, `timeTo${marker}`, `Time from app start to ${marker}`);
-  }
-
-  content += "\nMarker-to-marker timings (averaged over successful runs):\n";
-  for (let i = 0; i < config.customMarkers.length; i++) {
-    for (let j = i + 1; j < config.customMarkers.length; j++) {
-      const marker1 = config.customMarkers[i];
-      const marker2 = config.customMarkers[j];
-      addAverageToSummary(content, allMetrics, `${marker1}To${marker2}`, `Time from ${marker1} to ${marker2}`);
-    }
-  }
-
-  content += "\nFrame rendering performance (averaged over successful runs):\n";
-  addAverageToSummary(content, allMetrics, "avgFrameDuration", "Average frame duration", "milliseconds");
-  addAverageToSummary(content, allMetrics, "avgFps", "Average FPS", "frames per second");
-  addAverageToSummary(content, allMetrics, "jankyPercentage", "Janky frames percentage (>16.67ms)", "%");
-  addAverageToSummary(content, allMetrics, "severeJankyPercentage", "Severe jank percentage (>33.33ms)", "%");
-
-  await Deno.writeTextFile(summaryFile, content);
-  console.log(`Summary report saved to ${summaryFile}`);
-
+  // Add metric to the collection
   function addMetric(metrics: Record<string, number[]>, name: string, value: number): void {
     if (!metrics[name]) metrics[name] = [];
     metrics[name].push(value);
   }
 
+  // Add average to summary
   function addAverageToSummary(
     content: string,
     metrics: Record<string, number[]>,
@@ -740,21 +703,182 @@ async function generateSummaryReport(config: Config): Promise<void> {
     }
     return content;
   }
+
+  // Process each metrics file
+  const dirEntries = await Deno.readDir(config.outputDir);
+  for await (const file of dirEntries) {
+    if (file.name.startsWith("metrics_") && file.name.endsWith(".txt")) {
+      const filePath = join(config.outputDir, file.name);
+      const fileContent = await Deno.readTextFile(filePath);
+      const lines = fileContent.split("\n");
+
+      for (const line of lines) {
+        // Function to extract a metric from a line
+        const extractMetric = (pattern: RegExp): number | null => {
+          const match = line.match(pattern);
+          return match ? parseFloat(match[1]) : null;
+        };
+
+        // Extract standard metrics
+        const timeToCreate = extractMetric(/Time from intent to performCreate: ([0-9.]+) seconds/);
+        if (timeToCreate) addMetric(allMetrics, "timeToCreate", timeToCreate);
+
+        const timeToStart = extractMetric(/Time from intent to performStart: ([0-9.]+) seconds/);
+        if (timeToStart) addMetric(allMetrics, "timeToStart", timeToStart);
+
+        const timeToResume = extractMetric(/Time from intent to performResume: ([0-9.]+) seconds/);
+        if (timeToResume) addMetric(allMetrics, "timeToResume", timeToResume);
+
+        const timeToFullyDrawn = extractMetric(/Total time to fully drawn: ([0-9.]+) seconds/);
+        if (timeToFullyDrawn) addMetric(allMetrics, "timeToFullyDrawn", timeToFullyDrawn);
+
+        // Extract custom marker metrics
+        for (const marker of config.customMarkers) {
+          const timeToMarker = extractMetric(new RegExp(`Time from app start to ${marker}: ([0-9.]+) seconds`));
+          if (timeToMarker) addMetric(allMetrics, `timeTo${marker}`, timeToMarker);
+        }
+
+        // Extract paired marker metrics
+        for (const pair of config.pairedMarkers) {
+          // Time to start marker
+          const timeToStart = extractMetric(new RegExp(`Time from app start to ${pair.start}: ([0-9.]+) seconds`));
+          if (timeToStart) addMetric(allMetrics, `timeTo${pair.start}`, timeToStart);
+
+          // Time to end marker
+          const timeToEnd = extractMetric(new RegExp(`Time from app start to ${pair.end}: ([0-9.]+) seconds`));
+          if (timeToEnd) addMetric(allMetrics, `timeTo${pair.end}`, timeToEnd);
+
+          // Duration of the paired operation
+          const duration = extractMetric(new RegExp(`Duration of ${pair.name}: ([0-9.]+) seconds`));
+          if (duration) addMetric(allMetrics, `${pair.name}Duration`, duration);
+        }
+
+        // Extract frame metrics
+        const avgFrameDuration = extractMetric(/Average frame duration: ([0-9.]+) ms/);
+        if (avgFrameDuration) addMetric(allMetrics, "avgFrameDuration", avgFrameDuration);
+
+        const avgFps = extractMetric(/Average FPS: ([0-9.]+)/);
+        if (avgFps) addMetric(allMetrics, "avgFps", avgFps);
+
+        const jankyPercentage = extractMetric(/Janky frames \(>16.67ms\): \d+ \(([0-9.]+)%\)/);
+        if (jankyPercentage) addMetric(allMetrics, "jankyPercentage", jankyPercentage);
+
+        const severeJankyPercentage = extractMetric(/Severe janky frames \(>33.33ms\): \d+ \(([0-9.]+)%\)/);
+        if (severeJankyPercentage) addMetric(allMetrics, "severeJankyPercentage", severeJankyPercentage);
+      }
+    }
+  }
+
+  // Generate summary content
+  let content = "===== Performance Summary Report =====\n";
+  content += `Date: ${new Date().toISOString()}\n`;
+  content += `Device: ${(await getDeviceInfo()).model || "Unknown"}\n`;
+  content += `App Package: ${config.appPackage}\n`;
+  content += `Test Iterations: ${config.iterations}\n\n`;
+
+  // Add app startup metrics
+  content += "== App Startup Performance ==\n";
+  content += "App startup performance (averaged over successful runs):\n";
+  addAverageToSummary(content, allMetrics, "timeToCreate", "Time from intent to performCreate");
+  addAverageToSummary(content, allMetrics, "timeToStart", "Time from intent to performStart");
+  addAverageToSummary(content, allMetrics, "timeToResume", "Time from intent to performResume");
+  addAverageToSummary(content, allMetrics, "timeToFullyDrawn", "Total time to fully drawn");
+
+  // Add custom marker metrics
+  content += "\n== Custom Marker Performance ==\n";
+  for (const marker of config.customMarkers) {
+    addAverageToSummary(content, allMetrics, `timeTo${marker}`, `Time from app start to ${marker}`);
+  }
+
+  // Add paired marker metrics
+  if (config.pairedMarkers.length > 0) {
+    content += "\n== Paired Marker Performance ==\n";
+    for (const pair of config.pairedMarkers) {
+      content += `=== ${pair.name} ===\n`;
+      addAverageToSummary(content, allMetrics, `timeTo${pair.start}`, `Time from app start to ${pair.start}`);
+      addAverageToSummary(content, allMetrics, `timeTo${pair.end}`, `Time from app start to ${pair.end}`);
+      addAverageToSummary(content, allMetrics, `${pair.name}Duration`, `Duration of ${pair.name}`);
+      content += "\n";
+    }
+  }
+
+  // Add frame metrics
+  content += "== Frame Rendering Performance ==\n";
+  addAverageToSummary(content, allMetrics, "avgFrameDuration", "Average frame duration", "ms");
+  addAverageToSummary(content, allMetrics, "avgFps", "Average FPS", "fps");
+  addAverageToSummary(content, allMetrics, "jankyPercentage", "Janky frames percentage", "%");
+  addAverageToSummary(content, allMetrics, "severeJankyPercentage", "Severe janky frames percentage", "%");
+
+  // Write summary to file
+  await Deno.writeTextFile(summaryFile, content);
+  console.log(`Summary report saved to ${summaryFile}`);
 }
 
 // Main function
 async function main() {
-  console.log("===== React Native App Performance Measurement =====");
+  console.log("===== React Native Performance Measurement Tool =====");
+
+  // Parse command line arguments
+  const args = Deno.args;
+  let packageName = PACKAGE_NAME;
+  let iterations = 3;
+  let outputDir = "./performance_traces";
+  let customMarkers: string[] = [];
+  let pairedMarkers: { start: string; end: string; name: string }[] = [];
+
+  // Process command line arguments
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--package" && i + 1 < args.length) {
+      packageName = args[++i];
+    } else if (args[i] === "--iterations" && i + 1 < args.length) {
+      iterations = parseInt(args[++i], 10);
+    } else if (args[i] === "--output" && i + 1 < args.length) {
+      outputDir = args[++i];
+    } else if (args[i] === "--marker" && i + 1 < args.length) {
+      customMarkers.push(args[++i]);
+    } else if (args[i] === "--paired-marker" && i + 3 < args.length) {
+      pairedMarkers.push({
+        start: args[++i],
+        end: args[++i],
+        name: args[++i]
+      });
+    }
+  }
+
+  // Update config with command line arguments
+  const config: Config = {
+    appPackage: packageName,
+    appActivity: `${packageName}.MainActivity`,
+    iterations,
+    traceDuration: 30,
+    outputDir,
+    customMarkers: customMarkers.length > 0 ? customMarkers : ["TEST_EVENT_MANUAL", "app_js_initialized", "first_screen_mounted"],
+    pairedMarkers: pairedMarkers.length > 0 ? pairedMarkers : [
+      { start: "trace_watchlist_tap_start", end: "trace_watchlist_fully_loaded_end", name: "watchlist_load" },
+      { start: "trace_article_tap_start", end: "trace_article_fully_loaded_end", name: "article_load" }
+    ],
+    deviceTracePath: "/data/local/tmp/atrace_output.txt",
+    traceCategories: ["gfx", "view", "wm", "am", "input", "sched", "app"]
+  };
+
   console.log(`App Package: ${config.appPackage}`);
-  console.log(`Running ${config.iterations} test iterations...`);
-  console.log(`Output directory: ${config.outputDir}`);
-  console.log("==================================================");
+  console.log(`Iterations: ${config.iterations}`);
+  console.log(`Output Directory: ${config.outputDir}`);
+  console.log(`Custom Markers: ${config.customMarkers.join(", ")}`);
+  console.log("Paired Markers:");
+  for (const pair of config.pairedMarkers) {
+    console.log(`  - ${pair.name}: ${pair.start} → ${pair.end}`);
+  }
+  console.log("=================================================");
 
   // Check if device is connected
   if (!await checkDeviceConnected()) {
-    console.error("No device connected. Please connect a device and try again.");
+    console.error("No Android device connected. Please connect a device and try again.");
     Deno.exit(1);
   }
+
+  // Track successful runs
+  const successfulRuns: number[] = [];
 
   // Create output directory
   await ensureDir(config.outputDir);
@@ -778,6 +902,14 @@ async function main() {
   console.log(`\n===== Performance measurement completed =====`);
   console.log(`Successful runs: ${successfulRuns.length}/${config.iterations}`);
   console.log(`Results saved to ${config.outputDir}`);
+
+  // Print usage tips
+  console.log("\nUsage Tips:");
+  console.log("1. To add custom markers in your React Native app, use the PerfettoTracer API:");
+  console.log("   - For JavaScript: PerfettoTracer.beginTrace('YOUR_MARKER_NAME')");
+  console.log("   - For paired markers: Use start/end pairs like 'trace_screen_start' and 'trace_screen_end'");
+  console.log("2. All times are measured from app launch (t=0)");
+  console.log("3. View detailed metrics in the individual run files and summary in summary_report.txt");
 }
 
 // Run the main function
