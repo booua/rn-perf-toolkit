@@ -1,7 +1,14 @@
 #!/usr/bin/env -S deno run --allow-run --allow-read --allow-write --allow-env
 
-import { ensureDir } from "https://deno.land/std@0.224.0/fs/mod.ts";
-import { join } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { parse as parseArgs } from "https://deno.land/std@0.224.0/flags/mod.ts";
+
+const PACKAGE_NAME = "com.bloomberg.android.plus";
+
+interface PairedMarker {
+  start: string;
+  end: string;
+  name: string;
+}
 
 interface Config {
   appPackage: string;
@@ -9,35 +16,44 @@ interface Config {
   iterations: number;
   traceDuration: number;
   outputDir: string;
-  customMarkers: string[];
-  pairedMarkers: { start: string; end: string; name: string }[];
   deviceTracePath: string;
-  traceCategories: string[];
+  customMarkers: string[];
+  pairedMarkers: PairedMarker[];
+  traceCategories: string;
 }
-
-const PACKAGE_NAME = "com.example.app";
 
 async function runCommand(
   cmd: string,
   args: string[],
-  options: Deno.CommandOptions = {}
+  options: { stderr?: "piped" | "null" } = {}
 ): Promise<{ success: boolean; stdout: string; stderr: string }> {
-  const defaultOptions: Deno.CommandOptions = {
-    stdout: "piped",
-    stderr: "piped",
-  };
+  console.log(`Running command: ${cmd} ${args.join(" ")}`);
 
   try {
-    const proc = new Deno.Command(cmd, { ...defaultOptions, ...options, args });
-    const output = await proc.output();
+    const process = new Deno.Command(cmd, {
+      args: args,
+      stdout: "piped",
+      stderr: options.stderr === "null" ? "null" : "piped",
+    });
+
+    const output = await process.output();
+
+    const textDecoder = new TextDecoder();
+    const stdoutText = textDecoder.decode(output.stdout);
+    const stderrText = textDecoder.decode(output.stderr);
+
+    if (!output.success) {
+      console.error(`Command failed with exit code ${output.code}`);
+      if (stderrText) console.error(`Error: ${stderrText}`);
+    }
 
     return {
       success: output.success,
-      stdout: new TextDecoder().decode(output.stdout),
-      stderr: new TextDecoder().decode(output.stderr),
+      stdout: stdoutText,
+      stderr: stderrText,
     };
   } catch (error) {
-    console.error(`Error executing command '${cmd}': ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`Failed to execute command: ${error instanceof Error ? error.message : String(error)}`);
     return {
       success: false,
       stdout: "",
@@ -63,156 +79,55 @@ async function clearAppData(appPackage: string): Promise<boolean> {
 async function startTrace(config: Config): Promise<boolean> {
   console.log("Starting trace capture...");
 
-  // Clear any existing trace data
-  await runCommand("adb", ["shell", "atrace", "--async_stop"]);
-  await runCommand("adb", ["shell", "atrace", "--clear"]);
-
-  // Make sure tracing is enabled
-  await runCommand("adb", ["shell", "echo", "1", ">", "/sys/kernel/debug/tracing/tracing_on"]);
-
-  // Set buffer size to a much larger value (64MB)
-  await runCommand("adb", ["shell", "echo", "65536", ">", "/sys/kernel/debug/tracing/buffer_size_kb"]);
-
-  // Start tracing with a simpler, more reliable command
-  console.log(`Starting trace with categories: ${config.traceCategories.join(" ")}`);
-  const startResult = await runCommand("adb", [
+  // Use the exact same approach as the shell script
+  const { success, stderr } = await runCommand("adb", [
     "shell",
-    "atrace",
-    "--async_start",
-    "-b", "65536",  // Use a large buffer size
-    "-t", config.traceDuration.toString(),
-    "-a", config.appPackage,
-    ...config.traceCategories
+    `atrace --async_start -a ${config.appPackage} -b 16000 -c ${config.traceCategories}`
   ]);
 
-  if (!startResult.success) {
-    console.error(`Failed to start trace: ${startResult.stderr}`);
-
-    // Try an alternative approach with fewer categories
-    console.log("Trying with fewer trace categories...");
-    const basicCategories = ["gfx", "view", "app"];
-    const altStartResult = await runCommand("adb", [
-      "shell",
-      "atrace",
-      "--async_start",
-      "-b", "65536",
-      "-t", config.traceDuration.toString(),
-      "-a", config.appPackage,
-      ...basicCategories
-    ]);
-
-    if (!altStartResult.success) {
-      console.error(`Alternative approach also failed: ${altStartResult.stderr}`);
-      return false;
-    }
-
-    console.log("Started trace with basic categories");
-  } else {
-    console.log("Trace started successfully");
+  if (!success) {
+    console.error(`Failed to start trace: ${stderr}`);
+    return false;
   }
 
+  console.log("Trace capture started");
   return true;
 }
 
 async function stopTrace(config: Config): Promise<boolean> {
   console.log("Stopping trace capture...");
 
-  // Stop the trace
-  const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
-  if (!stopResult.success) {
-    console.error(`Failed to stop trace: ${stopResult.stderr}`);
+  // Use the exact same approach as the shell script
+  const { success, stderr } = await runCommand("adb", [
+    "shell",
+    `atrace --async_stop -o ${config.deviceTracePath}`
+  ]);
+
+  if (!success) {
+    console.error(`Failed to stop trace: ${stderr}`);
     return false;
   }
 
-  console.log("Trace stopped, retrieving data...");
-
-  // Create a temporary file on the device
-  const tempDeviceFile = "/data/local/tmp/perfetto_trace.txt";
-
-  // Use a direct approach - dump trace to a file on the device
-  const dumpCmd = await runCommand("adb", [
-    "shell",
-    "atrace",
-    "--async_dump",
-    ">",
-    tempDeviceFile
-  ]);
-
-  if (!dumpCmd.success) {
-    console.error("Failed to dump trace to device file, trying direct capture...");
-
-    // Try capturing the trace directly to the host
-    const localTempFile = `${config.outputDir}/temp_trace.txt`;
-
-    // Use a direct pipe to capture the trace data
-    const directDumpCmd = await runCommand("adb", [
-      "exec-out",
-      "atrace",
-      "--async_dump"
-    ]);
-
-    if (directDumpCmd.success && directDumpCmd.stdout) {
-      console.log(`Captured ${directDumpCmd.stdout.length} bytes of trace data directly`);
-
-      try {
-        await Deno.writeTextFile(localTempFile, directDumpCmd.stdout);
-        console.log(`Wrote trace data to ${localTempFile}`);
-
-        // Copy to the final location
-        await Deno.copyFile(localTempFile, config.deviceTracePath);
-        return true;
-      } catch (error) {
-        console.error(`Failed to write trace data: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      }
-    } else {
-      console.error("Direct capture failed, trying system trace file...");
-
-      // Try to get the trace from the system trace file
-      const sysTraceCmd = await runCommand("adb", [
-        "exec-out",
-        "cat",
-        "/sys/kernel/debug/tracing/trace"
-      ]);
-
-      if (sysTraceCmd.success && sysTraceCmd.stdout) {
-        console.log(`Captured ${sysTraceCmd.stdout.length} bytes from system trace file`);
-
-        try {
-          await Deno.writeTextFile(localTempFile, sysTraceCmd.stdout);
-          console.log(`Wrote system trace data to ${localTempFile}`);
-
-          // Copy to the final location
-          await Deno.copyFile(localTempFile, config.deviceTracePath);
-          return true;
-        } catch (error) {
-          console.error(`Failed to write system trace data: ${error instanceof Error ? error.message : String(error)}`);
-          return false;
-        }
-      } else {
-        console.error("All trace capture methods failed");
-        return false;
-      }
-    }
-  }
-
-  // Set the device trace path to our temp file
-  config.deviceTracePath = tempDeviceFile;
-
-  console.log(`Trace data saved to ${config.deviceTracePath} on device`);
+  console.log("Trace capture stopped");
   return true;
 }
 
 async function launchApp(config: Config): Promise<string> {
   console.log("Launching app...");
-  const { stdout } = await runCommand("adb", [
+  const activityName = config.appActivity || `${config.appPackage}.MainActivity`;
+  const { success, stdout, stderr } = await runCommand("adb", [
     "shell",
     "am",
     "start-activity",
     "-W",
-    "-n",
-    `${config.appPackage}/${config.appActivity}`
+    `${config.appPackage}/${activityName}`
   ]);
+
+  if (!success) {
+    console.error(`Failed to launch app: ${stderr}`);
+    return "";
+  }
+
   return stdout;
 }
 
@@ -231,254 +146,89 @@ async function takeScreenshot(outputPath: string): Promise<boolean> {
 }
 
 async function pullTraceFile(config: Config, localPath: string): Promise<boolean> {
-  console.log(`Pulling trace file from ${config.deviceTracePath}...`);
+  console.log("Pulling trace file...");
 
-  // First check if the trace file exists and has content
-  const checkResult = await runCommand("adb", ["shell", `ls -l "${config.deviceTracePath}"`]);
+  // Use the exact same approach as the shell script
+  const { success, stderr } = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
 
-  if (!checkResult.success || !checkResult.stdout.trim()) {
-    console.error("Trace file does not exist or is empty on device");
+  if (!success) {
+    console.error(`Failed to pull trace file: ${stderr}`);
     return false;
   }
 
-  // Check file size
-  const sizeCheck = await runCommand("adb", ["shell", `stat -c %s "${config.deviceTracePath}"`]);
-  if (sizeCheck.success) {
-    const size = parseInt(sizeCheck.stdout.trim(), 10);
-    console.log(`Trace file size: ${size} bytes`);
-
-    if (size < 1000) {
-      console.warn("Warning: Trace file is very small, may not contain valid data");
-    }
-  }
-
-  // Try to pull the file using exec-out to avoid any shell redirection issues
-  console.log(`Pulling trace file to ${localPath}...`);
-  const catResult = await runCommand("adb", ["exec-out", `cat "${config.deviceTracePath}"`]);
-
-  if (catResult.success && catResult.stdout) {
-    console.log(`Retrieved ${catResult.stdout.length} bytes of trace data, writing to local file...`);
-    try {
-      await Deno.writeTextFile(localPath, catResult.stdout);
-      console.log("Successfully wrote trace data to local file");
-
-      // Verify the file
-      const fileInfo = await Deno.stat(localPath);
-      console.log(`Trace file size: ${fileInfo.size} bytes`);
-
-      // Check if the file contains actual trace data
-      const fileContent = await Deno.readTextFile(localPath);
-      if (fileContent.includes("TRACE:") && fileContent.includes("TIMESTAMP") && fileContent.length > 1000) {
-        console.log("Trace file contains valid trace data");
-        return true;
-      } else {
-        console.warn("Warning: Trace file may not contain valid trace data");
-
-        // Try one more approach - use adb pull directly
-        console.log("Trying direct adb pull as fallback...");
-        const pullResult = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
-
-        if (pullResult.success) {
-          console.log("Successfully pulled trace file using direct adb pull");
-          return true;
-        }
-      }
-
-      return fileInfo.size > 1000;
-    } catch (error) {
-      console.error(`Failed to write trace data to local file: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  // If we get here, try the traditional pull method as a last resort
-  console.log("Trying traditional adb pull method...");
-  const pullResult = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
-
-  if (pullResult.success) {
-    console.log("Successfully pulled trace file");
-    return true;
-  }
-
-  console.error("All methods to pull the trace file failed");
-  return false;
+  console.log(`Successfully pulled trace file to ${localPath}`);
+  return true;
 }
 
 async function getDeviceInfo(): Promise<Record<string, string>> {
+  console.log("Getting device information...");
   const info: Record<string, string> = {};
 
-  const model = await runCommand("adb", ["shell", "getprop", "ro.product.model"]);
-  if (model.success) info.model = model.stdout.trim();
+  // Get device model
+  const modelResult = await runCommand("adb", ["shell", "getprop", "ro.product.model"]);
+  if (modelResult.success) {
+    info.model = modelResult.stdout.trim();
+  }
 
-  const androidVersion = await runCommand("adb", ["shell", "getprop", "ro.build.version.release"]);
-  if (androidVersion.success) info.androidVersion = androidVersion.stdout.trim();
+  // Get Android version
+  const versionResult = await runCommand("adb", ["shell", "getprop", "ro.build.version.release"]);
+  if (versionResult.success) {
+    info.androidVersion = versionResult.stdout.trim();
+  }
 
   return info;
 }
 
-async function processTraceData(
-  traceFile: string,
-  metricsFile: string,
-  config: Config
-): Promise<Record<string, number>> {
-  console.log(`Processing trace data from ${traceFile}...`);
+async function processTraceData(config: Config, tracePath: string, iteration: number): Promise<void> {
+  console.log(`Processing trace data from ${tracePath}...`);
 
-  let traceContent: string;
+  const metricsPath = `${config.outputDir}/metrics_${iteration}.txt`;
+
+  // Create a metrics file
+  let metricsContent = "=== Performance Metrics ===\n";
+  metricsContent += `App Package: ${config.appPackage}\n`;
+  metricsContent += `Trace File: ${tracePath}\n\n`;
+
   try {
-    traceContent = await Deno.readTextFile(traceFile);
-  } catch (err) {
-    console.error(`Error reading trace file: ${err instanceof Error ? err.message : String(err)}`);
-    return {};
-  }
+    const traceContent = await Deno.readTextFile(tracePath);
 
-  const metrics: Record<string, number> = {};
-
-  const appStartMatch = traceContent.match(/([0-9.]+).*ActivityManager.*START.*?${config.appPackage}/);
-  const appStartTimestamp = appStartMatch ? parseFloat(appStartMatch[1]) : 0;
-  metrics.appStartTimestamp = appStartTimestamp;
-
-  if (!appStartTimestamp) {
-    console.error("Could not find app start timestamp in trace. Metrics will be incomplete.");
-  }
-
-  const createMatch = traceContent.match(/([0-9.]+).*performCreate.*?${config.appPackage}/);
-  const startMatch = traceContent.match(/([0-9.]+).*performStart.*?${config.appPackage}/);
-  const resumeMatch = traceContent.match(/([0-9.]+).*performResume.*?${config.appPackage}/);
-  const drawnMatch = traceContent.match(/([0-9.]+).*reportFullyDrawn.*?${config.appPackage}/);
-
-  if (createMatch) metrics.activityCreateTimestamp = parseFloat(createMatch[1]);
-  if (startMatch) metrics.activityStartTimestamp = parseFloat(startMatch[1]);
-  if (resumeMatch) metrics.activityResumeTimestamp = parseFloat(resumeMatch[1]);
-  if (drawnMatch) metrics.activityDrawnTimestamp = parseFloat(drawnMatch[1]);
-
-  for (const marker of config.customMarkers) {
-    const patterns = [
-      new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${marker}`),
-      new RegExp(`([0-9.]+).*PerfettoTracer.*${marker}`),
-      new RegExp(`([0-9.]+).*beginTrace.*${marker}`),
-      new RegExp(`([0-9.]+).*${marker}.*begin`),
-      new RegExp(`([0-9.]+).*begin.*${marker}`),
-      new RegExp(`([0-9.]+).*TEST_EVENT_MANUAL`),
-      new RegExp(`([0-9.]+).*test_event_manual`),
-      new RegExp(`([0-9.]+).*${marker}`),
-    ];
-
-    for (const pattern of patterns) {
-      const markerMatch = traceContent.match(pattern);
-      if (markerMatch) {
-        metrics[`${marker}Timestamp`] = parseFloat(markerMatch[1]);
-        console.log(`Found marker: ${marker} at time ${markerMatch[1]}`);
-        break;
-      }
-    }
-  }
-
-  for (const pair of config.pairedMarkers) {
-    const startPatterns = [
-      new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${pair.start}`),
-      new RegExp(`([0-9.]+).*PerfettoTracer.*${pair.start}`),
-      new RegExp(`([0-9.]+).*${pair.start}`),
-    ];
-
-    const endPatterns = [
-      new RegExp(`([0-9.]+).*PerfettoTracer.*beginTrace.*${pair.end}`),
-      new RegExp(`([0-9.]+).*PerfettoTracer.*${pair.end}`),
-      new RegExp(`([0-9.]+).*${pair.end}`),
-    ];
-
-    let startTimestamp = 0;
-    let endTimestamp = 0;
-
-    for (const pattern of startPatterns) {
-      const match = traceContent.match(pattern);
-      if (match) {
-        startTimestamp = parseFloat(match[1]);
-        metrics[`${pair.start}Timestamp`] = startTimestamp;
-        console.log(`Found start marker: ${pair.start} at time ${startTimestamp}`);
-        break;
-      }
-    }
-
-    for (const pattern of endPatterns) {
-      const match = traceContent.match(pattern);
-      if (match) {
-        endTimestamp = parseFloat(match[1]);
-        metrics[`${pair.end}Timestamp`] = endTimestamp;
-        console.log(`Found end marker: ${pair.end} at time ${endTimestamp}`);
-        break;
-      }
-    }
-
-    if (startTimestamp && endTimestamp) {
-      metrics[`${pair.name}Duration`] = endTimestamp - startTimestamp;
-      console.log(`Duration for ${pair.name}: ${metrics[`${pair.name}Duration`].toFixed(3)}s`);
-    }
-  }
-
-  for (const marker of config.customMarkers) {
-    if (!metrics[`${marker}Timestamp`]) {
-      console.log(`Warning: Marker '${marker}' not found in trace`);
-    }
-  }
-
-  for (const pair of config.pairedMarkers) {
-    if (!metrics[`${pair.start}Timestamp`]) {
-      console.log(`Warning: Start marker '${pair.start}' not found in trace`);
-    }
-    if (!metrics[`${pair.end}Timestamp`]) {
-      console.log(`Warning: End marker '${pair.end}' not found in trace`);
-    }
-  }
-
-  if (appStartTimestamp) {
-    if (metrics.activityCreateTimestamp) {
-      metrics.timeToCreate = metrics.activityCreateTimestamp - appStartTimestamp;
-    }
-    if (metrics.activityStartTimestamp) {
-      metrics.timeToStart = metrics.activityStartTimestamp - appStartTimestamp;
-    }
-    if (metrics.activityResumeTimestamp) {
-      metrics.timeToResume = metrics.activityResumeTimestamp - appStartTimestamp;
-    }
-    if (metrics.activityDrawnTimestamp) {
-      metrics.timeToFullyDrawn = metrics.activityDrawnTimestamp - appStartTimestamp;
-    }
-
+    // Check for custom markers
+    metricsContent += "== Custom Markers ==\n";
     for (const marker of config.customMarkers) {
-      const markerTimestamp = metrics[`${marker}Timestamp`];
-      if (markerTimestamp) {
-        metrics[`timeTo${marker}`] = markerTimestamp - appStartTimestamp;
+      if (traceContent.includes(marker)) {
+        metricsContent += `Found marker: ${marker}\n`;
+      } else {
+        metricsContent += `Marker not found: ${marker}\n`;
       }
     }
 
-    for (const pair of config.pairedMarkers) {
-      const startTimestamp = metrics[`${pair.start}Timestamp`];
-      const endTimestamp = metrics[`${pair.end}Timestamp`];
+    // Check for paired markers
+    if (config.pairedMarkers.length > 0) {
+      metricsContent += "\n== Paired Markers ==\n";
+      for (const pair of config.pairedMarkers) {
+        metricsContent += `=== ${pair.name} ===\n`;
 
-      if (startTimestamp) {
-        metrics[`timeTo${pair.start}`] = startTimestamp - appStartTimestamp;
-      }
+        const startFound = traceContent.includes(pair.start);
+        const endFound = traceContent.includes(pair.end);
 
-      if (endTimestamp) {
-        metrics[`timeTo${pair.end}`] = endTimestamp - appStartTimestamp;
+        metricsContent += `Start marker (${pair.start}): ${startFound ? "Found" : "Not found"}\n`;
+        metricsContent += `End marker (${pair.end}): ${endFound ? "Found" : "Not found"}\n`;
+
+        if (startFound && endFound) {
+          metricsContent += `Both markers found for ${pair.name}\n`;
+        } else {
+          metricsContent += `Incomplete marker pair for ${pair.name}\n`;
+        }
+
+        metricsContent += "\n";
       }
     }
+
+    await Deno.writeTextFile(metricsPath, metricsContent);
+    console.log(`Metrics saved to ${metricsPath}`);
+  } catch (error) {
+    console.error(`Error processing trace data: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  if (metrics.activityCreateTimestamp && metrics.activityStartTimestamp) {
-    metrics.createToStart = metrics.activityStartTimestamp - metrics.activityCreateTimestamp;
-  }
-
-  if (metrics.activityStartTimestamp && metrics.activityResumeTimestamp) {
-    metrics.startToResume = metrics.activityResumeTimestamp - metrics.activityStartTimestamp;
-  }
-
-  if (appStartTimestamp && metrics.activityResumeTimestamp) {
-    metrics.totalStartupTime = metrics.activityResumeTimestamp - appStartTimestamp;
-  }
-
-  await writeMetricsToFile(metricsFile, metrics, config);
-
-  return metrics;
 }
 
 async function writeMetricsToFile(
@@ -634,178 +384,110 @@ async function writeMetricsToFile(
   console.log(`Metrics saved to ${metricsFile}`);
 }
 
-async function runTestIteration(iteration: number, config: Config): Promise<boolean> {
-  console.log(`\n=== Running test iteration ${iteration} ===`);
+async function runPerformanceTests(config: Config) {
+  console.log("Starting performance tests...");
 
-  const traceOutput = join(config.outputDir, `trace_iteration_${iteration}.perfetto`);
-  const metricsFile = join(config.outputDir, `metrics_${iteration}.txt`);
-  const screenshotPath = join(config.outputDir, `screen_${iteration}.png`);
-
-  await runCommand("adb", ["shell", "am", "force-stop", config.appPackage]);
-
-  if (!await clearAppData(config.appPackage)) {
-    console.error("Failed to clear app data");
-    return false;
+  // Check if device is connected
+  if (!await checkDeviceConnected()) {
+    console.error("No Android device connected. Please connect a device and try again.");
+    return;
   }
 
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  for (let i = 1; i <= config.iterations; i++) {
+    console.log(`\n=== Running test iteration ${i} ===`);
 
-  if (!await startTrace(config)) {
-    console.error("Failed to start trace");
-    return false;
+    // Clear app data
+    if (!await clearAppData(config.appPackage)) {
+      console.error("Failed to clear app data. Skipping iteration.");
+      continue;
+    }
+
+    // Start tracing
+    const traceStarted = await startTrace(config);
+    if (!traceStarted) {
+      console.error("Failed to start tracing. Skipping iteration.");
+      continue;
+    }
+
+    // Launch app
+    console.log("Launching app...");
+    const launchOutput = await launchApp(config);
+    console.log(launchOutput);
+
+    // Wait for app to be fully loaded
+    console.log(`Waiting for ${config.traceDuration} seconds...`);
+    await new Promise(resolve => setTimeout(resolve, config.traceDuration * 1000));
+
+    // Take a screenshot
+    const screenshotPath = `${config.outputDir}/screenshot_${i}.png`;
+    await takeScreenshot(screenshotPath);
+
+    // Stop tracing
+    const traceStopped = await stopTrace(config);
+    if (!traceStopped) {
+      console.error("Failed to stop tracing. Skipping iteration.");
+      continue;
+    }
+
+    // Pull trace file
+    const localTracePath = `${config.outputDir}/trace_iteration_${i}.perfetto`;
+    const tracePulled = await pullTraceFile(config, localTracePath);
+
+    if (!tracePulled) {
+      console.error("Failed to pull trace file. Skipping iteration.");
+      continue;
+    }
+
+    // Process trace data
+    await processTraceData(config, localTracePath, i);
   }
 
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  // Generate summary report
+  await generateSummaryReport(config);
 
-  const launchOutput = await launchApp(config);
-  console.log(launchOutput);
-
-  console.log("Waiting for app to fully initialize and capture custom markers...");
-  await new Promise(resolve => setTimeout(resolve, 10000));
-
-  console.log("App should be fully initialized now, custom markers should be captured");
-
-  if (!await takeScreenshot(screenshotPath)) {
-    console.error("Failed to take screenshot");
-  }
-
-  await runCommand("adb", ["shell", "am", "force-stop", config.appPackage]);
-
-  if (!await stopTrace(config)) {
-    console.error("Failed to stop trace");
-    return false;
-  }
-
-  if (!await pullTraceFile(config, traceOutput)) {
-    console.error("Failed to pull trace file");
-    return false;
-  }
-
-  await processTraceData(traceOutput, metricsFile, config);
-
-  return true;
+  console.log("\n===== Performance measurement completed =====");
+  console.log(`Results saved to ${config.outputDir}`);
 }
 
 async function generateSummaryReport(config: Config): Promise<void> {
   console.log("Generating summary report...");
-  const summaryFile = join(config.outputDir, "summary_report.txt");
-  const allMetrics: Record<string, number[]> = {};
-
-  function addMetric(metrics: Record<string, number[]>, name: string, value: number): void {
-    if (!metrics[name]) metrics[name] = [];
-    metrics[name].push(value);
-  }
-
-  function addAverageToSummary(
-    content: string,
-    metrics: Record<string, number[]>,
-    metricName: string,
-    displayName: string,
-    unit: string = "seconds"
-  ): string {
-    const values = metrics[metricName];
-    if (values && values.length > 0) {
-      const avg = values.reduce((sum, val) => sum + val, 0) / values.length;
-      content += `- ${displayName}: ${avg.toFixed(3)} ${unit} (averaged over ${values.length} runs)\n`;
-    } else {
-      content += `- ${displayName}: No data available\n`;
-    }
-    return content;
-  }
-
-  const dirEntries = await Deno.readDir(config.outputDir);
-  for await (const file of dirEntries) {
-    if (file.name.startsWith("metrics_") && file.name.endsWith(".txt")) {
-      const filePath = join(config.outputDir, file.name);
-      const fileContent = await Deno.readTextFile(filePath);
-      const lines = fileContent.split("\n");
-
-      for (const line of lines) {
-        const extractMetric = (pattern: RegExp): number | null => {
-          const match = line.match(pattern);
-          return match ? parseFloat(match[1]) : null;
-        };
-
-        const timeToCreate = extractMetric(/Time from intent to performCreate: ([0-9.]+) seconds/);
-        if (timeToCreate) addMetric(allMetrics, "timeToCreate", timeToCreate);
-
-        const timeToStart = extractMetric(/Time from intent to performStart: ([0-9.]+) seconds/);
-        if (timeToStart) addMetric(allMetrics, "timeToStart", timeToStart);
-
-        const timeToResume = extractMetric(/Time from intent to performResume: ([0-9.]+) seconds/);
-        if (timeToResume) addMetric(allMetrics, "timeToResume", timeToResume);
-
-        const timeToFullyDrawn = extractMetric(/Total time to fully drawn: ([0-9.]+) seconds/);
-        if (timeToFullyDrawn) addMetric(allMetrics, "timeToFullyDrawn", timeToFullyDrawn);
-
-        for (const marker of config.customMarkers) {
-          const timeToMarker = extractMetric(new RegExp(`Time from app start to ${marker}: ([0-9.]+) seconds`));
-          if (timeToMarker) addMetric(allMetrics, `timeTo${marker}`, timeToMarker);
-        }
-
-        for (const pair of config.pairedMarkers) {
-          const timeToStart = extractMetric(new RegExp(`Time from app start to ${pair.start}: ([0-9.]+) seconds`));
-          if (timeToStart) addMetric(allMetrics, `timeTo${pair.start}`, timeToStart);
-
-          const timeToEnd = extractMetric(new RegExp(`Time from app start to ${pair.end}: ([0-9.]+) seconds`));
-          if (timeToEnd) addMetric(allMetrics, `timeTo${pair.end}`, timeToEnd);
-
-          const duration = extractMetric(new RegExp(`Duration of ${pair.name}: ([0-9.]+) seconds`));
-          if (duration) addMetric(allMetrics, `${pair.name}Duration`, duration);
-        }
-
-        const avgFrameDuration = extractMetric(/Average frame duration: ([0-9.]+) ms/);
-        if (avgFrameDuration) addMetric(allMetrics, "avgFrameDuration", avgFrameDuration);
-
-        const avgFps = extractMetric(/Average FPS: ([0-9.]+)/);
-        if (avgFps) addMetric(allMetrics, "avgFps", avgFps);
-
-        const jankyPercentage = extractMetric(/Janky frames \(>16.67ms\): \d+ \(([0-9.]+)%\)/);
-        if (jankyPercentage) addMetric(allMetrics, "jankyPercentage", jankyPercentage);
-
-        const severeJankyPercentage = extractMetric(/Severe janky frames \(>33.33ms\): \d+ \(([0-9.]+)%\)/);
-        if (severeJankyPercentage) addMetric(allMetrics, "severeJankyPercentage", severeJankyPercentage);
-      }
-    }
-  }
+  const summaryPath = `${config.outputDir}/summary_report.txt`;
 
   let content = "===== Performance Summary Report =====\n";
   content += `Date: ${new Date().toISOString()}\n`;
-  content += `Device: ${(await getDeviceInfo()).model || "Unknown"}\n`;
   content += `App Package: ${config.appPackage}\n`;
+  content += `App Activity: ${config.appActivity || `${config.appPackage}.MainActivity`}\n`;
   content += `Test Iterations: ${config.iterations}\n\n`;
 
-  content += "== App Startup Performance ==\n";
-  content += "App startup performance (averaged over successful runs):\n";
-  addAverageToSummary(content, allMetrics, "timeToCreate", "Time from intent to performCreate");
-  addAverageToSummary(content, allMetrics, "timeToStart", "Time from intent to performStart");
-  addAverageToSummary(content, allMetrics, "timeToResume", "Time from intent to performResume");
-  addAverageToSummary(content, allMetrics, "timeToFullyDrawn", "Total time to fully drawn");
+  // Get device info
+  const deviceInfo = await getDeviceInfo();
+  content += `Device Model: ${deviceInfo.model || "Unknown"}\n`;
+  content += `Android Version: ${deviceInfo.androidVersion || "Unknown"}\n\n`;
 
-  content += "\n== Custom Marker Performance ==\n";
+  // Add custom markers summary
+  content += "== Custom Markers ==\n";
   for (const marker of config.customMarkers) {
-    addAverageToSummary(content, allMetrics, `timeTo${marker}`, `Time from app start to ${marker}`);
+    content += `- ${marker}: Searched for in trace files\n`;
   }
 
-  if (config.pairedMarkers.length > 0) {
-    content += "\n== Paired Marker Performance ==\n";
-    for (const pair of config.pairedMarkers) {
-      content += `=== ${pair.name} ===\n`;
-      addAverageToSummary(content, allMetrics, `timeTo${pair.start}`, `Time from app start to ${pair.start}`);
-      addAverageToSummary(content, allMetrics, `timeTo${pair.end}`, `Time from app start to ${pair.end}`);
-      addAverageToSummary(content, allMetrics, `${pair.name}Duration`, `Duration of ${pair.name}`);
-      content += "\n";
-    }
-  }
+  await Deno.writeTextFile(summaryPath, content);
+  console.log(`Summary report saved to ${summaryPath}`);
+}
 
-  content += "== Frame Rendering Performance ==\n";
-  addAverageToSummary(content, allMetrics, "avgFrameDuration", "Average frame duration", "ms");
-  addAverageToSummary(content, allMetrics, "avgFps", "Average FPS", "fps");
-  addAverageToSummary(content, allMetrics, "jankyPercentage", "Janky frames percentage", "%");
-  addAverageToSummary(content, allMetrics, "severeJankyPercentage", "Severe janky frames percentage", "%");
+function printUsage() {
+  console.log(`
+Usage: deno run --allow-run --allow-read --allow-write --allow-env measure_performance.ts [options]
 
-  await Deno.writeTextFile(summaryFile, content);
-  console.log(`Summary report saved to ${summaryFile}`);
+Options:
+  -p, --package <package>       App package name
+  -a, --activity <activity>     App activity name
+  --iterations <number>         Number of test iterations
+  --trace-duration <seconds>    Duration of trace capture in seconds
+  -o, --output <directory>      Output directory for trace files
+  -m, --markers <markers>       Custom markers (comma-separated)
+  -e, --env <file>              Custom environment file
+  -h, --help                    Show this help message
+`);
 }
 
 async function loadEnvConfig(envPath: string = ".env"): Promise<Record<string, string>> {
@@ -848,172 +530,117 @@ async function loadEnvConfig(envPath: string = ".env"): Promise<Record<string, s
 
 async function loadMarkersConfig(configPath: string = "markers.json"): Promise<{
   customMarkers: string[];
-  pairedMarkers: { start: string; end: string; name: string }[]
+  pairedMarkers: PairedMarker[]
 }> {
   const defaultConfig = {
     customMarkers: ["TEST_EVENT_MANUAL", "app_js_initialized", "first_screen_mounted"],
-    pairedMarkers: []
+    pairedMarkers: [
+      { start: "trace_watchlist_tap_start", end: "trace_watchlist_fully_loaded_end", name: "watchlist_load" },
+      { start: "trace_article_tap_start", end: "trace_article_fully_loaded_end", name: "article_load" }
+    ]
   };
 
   try {
-    const configExists = await Deno.stat(configPath).then(
-      () => true,
-      () => false
-    );
-
-    if (!configExists) {
-      console.log(`No ${configPath} file found. Using default markers.`);
-      return defaultConfig;
-    }
-
-    const content = await Deno.readTextFile(configPath);
-    const markersConfig = JSON.parse(content);
-
-    console.log(`Loaded markers configuration from ${configPath}`);
+    const fileContent = await Deno.readTextFile(configPath);
+    const config = JSON.parse(fileContent);
     return {
-      customMarkers: markersConfig.customMarkers || defaultConfig.customMarkers,
-      pairedMarkers: markersConfig.pairedMarkers || defaultConfig.pairedMarkers
+      customMarkers: config.customMarkers || defaultConfig.customMarkers,
+      pairedMarkers: config.pairedMarkers || defaultConfig.pairedMarkers
     };
   } catch (error) {
-    console.error(`Error loading ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
+    console.warn(`Warning: Could not load markers config from ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
+    console.warn("Using default markers configuration");
     return defaultConfig;
   }
 }
 
 async function main() {
-  console.log("===== React Native Performance Measurement Tool =====");
-
+  // Load configuration from .env file if it exists
   const envConfig = await loadEnvConfig();
 
-  const args = Deno.args;
-  let packageName = envConfig.APP_PACKAGE || PACKAGE_NAME;
-  let appActivity = envConfig.APP_ACTIVITY || "";
-  let iterations = envConfig.ITERATIONS ? parseInt(envConfig.ITERATIONS, 10) : 3;
-  let traceDuration = envConfig.TRACE_DURATION ? parseInt(envConfig.TRACE_DURATION, 10) : 30;
-  let outputDir = envConfig.OUTPUT_DIR || "./performance_traces";
-  let deviceTracePath = envConfig.DEVICE_TRACE_PATH || "/data/local/tmp/atrace_output.txt";
-  let markersConfigPath = envConfig.MARKERS_CONFIG || "markers.json";
+  // Parse command line arguments
+  const args = parseArgs(Deno.args, {
+    string: ["package", "activity", "output", "env", "markers", "iterations", "traceDuration"],
+    boolean: ["help"],
+    alias: {
+      p: "package",
+      a: "activity",
+      o: "output",
+      h: "help",
+      e: "env",
+      m: "markers",
+    },
+  });
 
-  const markersConfig = await loadMarkersConfig(markersConfigPath);
-  let customMarkers = markersConfig.customMarkers;
-  let pairedMarkers = markersConfig.pairedMarkers;
-
-  let traceCategories = ["gfx", "view", "wm", "am", "input", "sched", "app", "binder_driver"];
-  if (envConfig.TRACE_CATEGORIES) {
-    traceCategories = envConfig.TRACE_CATEGORIES.split(",").map(category => category.trim());
+  if (args.help) {
+    printUsage();
+    return;
   }
 
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--package" && i + 1 < args.length) {
-      packageName = args[++i];
-    } else if (args[i] === "--activity" && i + 1 < args.length) {
-      appActivity = args[++i];
-    } else if (args[i] === "--iterations" && i + 1 < args.length) {
-      iterations = parseInt(args[++i], 10);
-    } else if (args[i] === "--trace-duration" && i + 1 < args.length) {
-      traceDuration = parseInt(args[++i], 10);
-    } else if (args[i] === "--output" && i + 1 < args.length) {
-      outputDir = args[++i];
-    } else if (args[i] === "--marker" && i + 1 < args.length) {
-      customMarkers.push(args[++i]);
-    } else if (args[i] === "--paired-marker" && i + 3 < args.length) {
-      pairedMarkers.push({
-        start: args[++i],
-        end: args[++i],
-        name: args[++i]
+  // Set configuration values from .env or defaults
+  const packageName = args.package || envConfig.APP_PACKAGE || PACKAGE_NAME;
+  const appActivity = args.activity || envConfig.APP_ACTIVITY || "";
+  const iterations = parseInt(args.iterations || envConfig.ITERATIONS || "3", 10);
+  const traceDuration = parseInt(args.traceDuration || envConfig.TRACE_DURATION || "30", 10);
+  const outputDir = args.output || envConfig.OUTPUT_DIR || "./performance_traces";
+  const deviceTracePath = "/data/local/tmp/trace.txt"; // Use the same path as in the shell script
+  const customMarkers = args.markers || envConfig.CUSTOM_MARKERS || "TEST_EVENT_MANUAL";
+
+  // Parse paired markers from environment
+  let pairedMarkers: PairedMarker[] = [];
+  if (envConfig.PAIRED_MARKERS) {
+    try {
+      // Try to parse as JSON first
+      pairedMarkers = JSON.parse(envConfig.PAIRED_MARKERS);
+    } catch (e) {
+      // If not valid JSON, try to parse as comma-separated list of "start:end:name" format
+      pairedMarkers = envConfig.PAIRED_MARKERS.split(",").map(pair => {
+        const [start, end, name] = pair.split(":");
+        return { start, end, name: name || `${start}_to_${end}` };
       });
-    } else if (args[i] === "--markers-config" && i + 1 < args.length) {
-      const customMarkersPath = args[++i];
-      const customMarkersConfig = await loadMarkersConfig(customMarkersPath);
-      customMarkers = [...customMarkers, ...customMarkersConfig.customMarkers];
-      pairedMarkers = [...pairedMarkers, ...customMarkersConfig.pairedMarkers];
-    } else if (args[i] === "--env" && i + 1 < args.length) {
-      const customEnvPath = args[++i];
-      const customEnvConfig = await loadEnvConfig(customEnvPath);
-
-      if (customEnvConfig.APP_PACKAGE) packageName = customEnvConfig.APP_PACKAGE;
-      if (customEnvConfig.APP_ACTIVITY) appActivity = customEnvConfig.APP_ACTIVITY;
-      if (customEnvConfig.ITERATIONS) iterations = parseInt(customEnvConfig.ITERATIONS, 10);
-      if (customEnvConfig.TRACE_DURATION) traceDuration = parseInt(customEnvConfig.TRACE_DURATION, 10);
-      if (customEnvConfig.OUTPUT_DIR) outputDir = customEnvConfig.OUTPUT_DIR;
-      if (customEnvConfig.DEVICE_TRACE_PATH) deviceTracePath = customEnvConfig.DEVICE_TRACE_PATH;
-
-      if (customEnvConfig.MARKERS_CONFIG) {
-        const customMarkersConfig = await loadMarkersConfig(customEnvConfig.MARKERS_CONFIG);
-        customMarkers = [...customMarkers, ...customMarkersConfig.customMarkers];
-        pairedMarkers = [...pairedMarkers, ...customMarkersConfig.pairedMarkers];
-      }
-
-      if (customEnvConfig.TRACE_CATEGORIES) {
-        traceCategories = customEnvConfig.TRACE_CATEGORIES.split(",").map(cat => cat.trim());
-      }
     }
   }
 
-  if (!appActivity) {
-    appActivity = `${packageName}.MainActivity`;
-  }
+  const traceCategories = envConfig.TRACE_CATEGORIES || "sched,gfx,view,wm,am,app,input";
 
+  // Create config object
   const config: Config = {
     appPackage: packageName,
     appActivity,
     iterations,
     traceDuration,
     outputDir,
-    customMarkers: customMarkers.length > 0 ? customMarkers : ["TEST_EVENT_MANUAL", "app_js_initialized", "first_screen_mounted"],
-    pairedMarkers: pairedMarkers.length > 0 ? pairedMarkers : [
-      { start: "trace_watchlist_tap_start", end: "trace_watchlist_fully_loaded_end", name: "watchlist_load" },
-      { start: "trace_article_tap_start", end: "trace_article_fully_loaded_end", name: "article_load" }
-    ],
     deviceTracePath,
-    traceCategories
+    customMarkers: customMarkers.split(","),
+    pairedMarkers,
+    traceCategories,
   };
 
-  console.log(`App Package: ${config.appPackage}`);
-  console.log(`App Activity: ${config.appActivity}`);
-  console.log(`Iterations: ${config.iterations}`);
-  console.log(`Trace Duration: ${config.traceDuration} seconds`);
-  console.log(`Output Directory: ${config.outputDir}`);
-  console.log(`Custom Markers: ${config.customMarkers.join(", ")}`);
-  console.log("Paired Markers:");
-  for (const pair of config.pairedMarkers) {
-    console.log(`  - ${pair.name}: ${pair.start} → ${pair.end}`);
-  }
-  console.log(`Trace Categories: ${config.traceCategories.join(", ")}`);
-  console.log("=================================================");
-
-  if (!await checkDeviceConnected()) {
-    console.error("No Android device connected. Please connect a device and try again.");
-    Deno.exit(1);
-  }
-
-  await ensureDir(config.outputDir);
-
-  await runCommand("adb", ["shell", "echo", "1", ">", "/sys/kernel/debug/tracing/tracing_on"], { stderr: "null" });
-
-  const successfulRuns: number[] = [];
-
-  for (let i = 1; i <= config.iterations; i++) {
-    const success = await runTestIteration(i, config);
-    if (success) {
-      successfulRuns.push(i);
+  // Create output directory if it doesn't exist
+  try {
+    await Deno.mkdir(config.outputDir, { recursive: true });
+  } catch (error) {
+    if (!(error instanceof Deno.errors.AlreadyExists)) {
+      console.error(`Failed to create output directory: ${error instanceof Error ? error.message : String(error)}`);
+      return;
     }
   }
 
-  if (successfulRuns.length > 0) {
-    await generateSummaryReport(config);
+  // Print configuration
+  console.log("===== React Native App Performance Measurement =====");
+  console.log(`App Package: ${config.appPackage}`);
+  console.log(`App Activity: ${config.appActivity || `${config.appPackage}.MainActivity`}`);
+  console.log(`Running ${config.iterations} test iterations...`);
+  console.log(`Output directory: ${config.outputDir}`);
+  console.log(`Trace categories: ${config.traceCategories}`);
+  console.log(`Custom markers: ${config.customMarkers.join(", ")}`);
+  if (config.pairedMarkers.length > 0) {
+    console.log(`Paired markers: ${config.pairedMarkers.map(pair => `${pair.start} to ${pair.end}`).join(", ")}`);
   }
+  console.log("==================================================");
 
-  console.log(`\n===== Performance measurement completed =====`);
-  console.log(`Successful runs: ${successfulRuns.length}/${config.iterations}`);
-  console.log(`Results saved to ${config.outputDir}`);
-
-  console.log("\nUsage Tips:");
-  console.log("1. To add custom markers in your React Native app, use the PerfettoTracer API:");
-  console.log("   - For JavaScript: PerfettoTracer.beginTrace('YOUR_MARKER_NAME')");
-  console.log("   - For paired markers: Use start/end pairs like 'trace_screen_start' and 'trace_screen_end'");
-  console.log("2. All times are measured from app launch (t=0)");
-  console.log("3. View detailed metrics in the individual run files and summary in summary_report.txt");
+  // Run performance tests
+  await runPerformanceTests(config);
 }
 
 if (import.meta.main) {
