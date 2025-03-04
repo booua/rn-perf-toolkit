@@ -61,25 +61,61 @@ async function clearAppData(appPackage: string): Promise<boolean> {
 }
 
 async function startTrace(config: Config): Promise<boolean> {
-  console.log("Starting atrace...");
+  console.log("Starting trace capture...");
 
+  // Clear any existing trace data
+  await runCommand("adb", ["shell", "atrace", "--async_stop"]);
+  await runCommand("adb", ["shell", "atrace", "--clear"]);
+
+  // Make sure tracing is enabled
   await runCommand("adb", ["shell", "echo", "1", ">", "/sys/kernel/debug/tracing/tracing_on"]);
 
-  const { success, stderr } = await runCommand("adb", [
+  // Set buffer size to a much larger value (64MB)
+  await runCommand("adb", ["shell", "echo", "65536", ">", "/sys/kernel/debug/tracing/buffer_size_kb"]);
+
+  // Start tracing with a simpler, more reliable command
+  console.log(`Starting trace with categories: ${config.traceCategories.join(" ")}`);
+  const startResult = await runCommand("adb", [
     "shell",
-    `atrace --async_start -b 4000 -t ${config.traceDuration} -a ${config.appPackage} ${config.traceCategories.join(" ")}`
+    "atrace",
+    "--async_start",
+    "-b", "65536",  // Use a large buffer size
+    "-t", config.traceDuration.toString(),
+    "-a", config.appPackage,
+    ...config.traceCategories
   ]);
 
-  if (!success) {
-    console.error(`Failed to start trace: ${stderr}`);
-    return false;
+  if (!startResult.success) {
+    console.error(`Failed to start trace: ${startResult.stderr}`);
+
+    // Try an alternative approach with fewer categories
+    console.log("Trying with fewer trace categories...");
+    const basicCategories = ["gfx", "view", "app"];
+    const altStartResult = await runCommand("adb", [
+      "shell",
+      "atrace",
+      "--async_start",
+      "-b", "65536",
+      "-t", config.traceDuration.toString(),
+      "-a", config.appPackage,
+      ...basicCategories
+    ]);
+
+    if (!altStartResult.success) {
+      console.error(`Alternative approach also failed: ${altStartResult.stderr}`);
+      return false;
+    }
+
+    console.log("Started trace with basic categories");
+  } else {
+    console.log("Trace started successfully");
   }
 
   return true;
 }
 
 async function stopTrace(config: Config): Promise<boolean> {
-  console.log("Stopping atrace and collecting trace data...");
+  console.log("Stopping trace capture...");
 
   // Stop the trace
   const stopResult = await runCommand("adb", ["shell", "atrace", "--async_stop"]);
@@ -88,57 +124,83 @@ async function stopTrace(config: Config): Promise<boolean> {
     return false;
   }
 
-  console.log("Trace stopped, dumping trace data...");
+  console.log("Trace stopped, retrieving data...");
 
-  try {
-    // Dump the trace directly to a file on the device with a larger buffer size
-    const dumpResult = await runCommand("adb", ["shell", `atrace --async_dump -b 32768 > "${config.deviceTracePath}"`]);
+  // Create a temporary file on the device
+  const tempDeviceFile = "/data/local/tmp/perfetto_trace.txt";
 
-    if (!dumpResult.success) {
-      console.error(`Failed to dump trace: ${dumpResult.stderr}`);
+  // Use a direct approach - dump trace to a file on the device
+  const dumpCmd = await runCommand("adb", [
+    "shell",
+    "atrace",
+    "--async_dump",
+    ">",
+    tempDeviceFile
+  ]);
 
-      // Try an alternative approach - dump to stdout and redirect to file
-      console.log("Trying alternative approach - dumping trace to stdout...");
-      const altDumpResult = await runCommand("adb", ["shell", "atrace", "--async_dump", "-b", "32768"]);
+  if (!dumpCmd.success) {
+    console.error("Failed to dump trace to device file, trying direct capture...");
 
-      if (altDumpResult.success && altDumpResult.stdout) {
-        console.log("Got trace data, writing to file on device...");
-        // Write the trace data to a file on the device
-        const tempFile = "/data/local/tmp/trace_data.txt";
-        const writeResult = await runCommand("adb", ["shell", `echo '${altDumpResult.stdout.replace(/'/g, "'\\''")}' > ${tempFile}`]);
+    // Try capturing the trace directly to the host
+    const localTempFile = `${config.outputDir}/temp_trace.txt`;
 
-        if (writeResult.success) {
-          console.log(`Trace data written to ${tempFile}`);
-          config.deviceTracePath = tempFile;
-        } else {
-          console.error(`Failed to write trace data: ${writeResult.stderr}`);
+    // Use a direct pipe to capture the trace data
+    const directDumpCmd = await runCommand("adb", [
+      "exec-out",
+      "atrace",
+      "--async_dump"
+    ]);
+
+    if (directDumpCmd.success && directDumpCmd.stdout) {
+      console.log(`Captured ${directDumpCmd.stdout.length} bytes of trace data directly`);
+
+      try {
+        await Deno.writeTextFile(localTempFile, directDumpCmd.stdout);
+        console.log(`Wrote trace data to ${localTempFile}`);
+
+        // Copy to the final location
+        await Deno.copyFile(localTempFile, config.deviceTracePath);
+        return true;
+      } catch (error) {
+        console.error(`Failed to write trace data: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    } else {
+      console.error("Direct capture failed, trying system trace file...");
+
+      // Try to get the trace from the system trace file
+      const sysTraceCmd = await runCommand("adb", [
+        "exec-out",
+        "cat",
+        "/sys/kernel/debug/tracing/trace"
+      ]);
+
+      if (sysTraceCmd.success && sysTraceCmd.stdout) {
+        console.log(`Captured ${sysTraceCmd.stdout.length} bytes from system trace file`);
+
+        try {
+          await Deno.writeTextFile(localTempFile, sysTraceCmd.stdout);
+          console.log(`Wrote system trace data to ${localTempFile}`);
+
+          // Copy to the final location
+          await Deno.copyFile(localTempFile, config.deviceTracePath);
+          return true;
+        } catch (error) {
+          console.error(`Failed to write system trace data: ${error instanceof Error ? error.message : String(error)}`);
           return false;
         }
       } else {
-        console.error(`Failed to get trace data: ${altDumpResult.stderr}`);
-
-        // Last resort - try dumping with a different approach
-        console.log("Trying final approach - dumping trace with cat...");
-        const finalDumpResult = await runCommand("adb", ["shell", `cat /sys/kernel/debug/tracing/trace > /data/local/tmp/trace_final.txt`]);
-
-        if (finalDumpResult.success) {
-          console.log("Final approach succeeded");
-          config.deviceTracePath = "/data/local/tmp/trace_final.txt";
-        } else {
-          console.error(`Final approach failed: ${finalDumpResult.stderr}`);
-          return false;
-        }
+        console.error("All trace capture methods failed");
+        return false;
       }
     }
-
-    console.log("Waiting for trace to be written...");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-
-    return true;
-  } catch (error) {
-    console.error(`Error in stopTrace: ${error instanceof Error ? error.message : String(error)}`);
-    return false;
   }
+
+  // Set the device trace path to our temp file
+  config.deviceTracePath = tempDeviceFile;
+
+  console.log(`Trace data saved to ${config.deviceTracePath} on device`);
+  return true;
 }
 
 async function launchApp(config: Config): Promise<string> {
@@ -167,6 +229,7 @@ async function takeScreenshot(outputPath: string): Promise<boolean> {
   await runCommand("adb", ["shell", "rm", tempPath]);
   return true;
 }
+
 async function pullTraceFile(config: Config, localPath: string): Promise<boolean> {
   console.log(`Pulling trace file from ${config.deviceTracePath}...`);
 
@@ -175,98 +238,71 @@ async function pullTraceFile(config: Config, localPath: string): Promise<boolean
 
   if (!checkResult.success || !checkResult.stdout.trim()) {
     console.error("Trace file does not exist or is empty on device");
+    return false;
+  }
 
-    // Look for alternative trace files
-    console.log("Looking for alternative trace files...");
-    const findResult = await runCommand("adb", ["shell", "ls -l /data/local/tmp/atrace*"]);
+  // Check file size
+  const sizeCheck = await runCommand("adb", ["shell", `stat -c %s "${config.deviceTracePath}"`]);
+  if (sizeCheck.success) {
+    const size = parseInt(sizeCheck.stdout.trim(), 10);
+    console.log(`Trace file size: ${size} bytes`);
 
-    if (findResult.success && findResult.stdout.trim()) {
-      console.log(`Found alternative trace files: ${findResult.stdout}`);
+    if (size < 1000) {
+      console.warn("Warning: Trace file is very small, may not contain valid data");
+    }
+  }
 
-      // Get the most recent or largest trace file
-      const altFiles = findResult.stdout.trim().split("\n");
-      let bestAltFile = "";
-      let largestSize = 0;
+  // Try to pull the file using exec-out to avoid any shell redirection issues
+  console.log(`Pulling trace file to ${localPath}...`);
+  const catResult = await runCommand("adb", ["exec-out", `cat "${config.deviceTracePath}"`]);
 
-      for (const fileLine of altFiles) {
-        const parts = fileLine.trim().split(/\s+/);
-        if (parts.length >= 5) {
-          const size = parseInt(parts[4], 10);
-          const path = parts[parts.length - 1];
+  if (catResult.success && catResult.stdout) {
+    console.log(`Retrieved ${catResult.stdout.length} bytes of trace data, writing to local file...`);
+    try {
+      await Deno.writeTextFile(localPath, catResult.stdout);
+      console.log("Successfully wrote trace data to local file");
 
-          if (size > largestSize) {
-            largestSize = size;
-            bestAltFile = path;
-          }
+      // Verify the file
+      const fileInfo = await Deno.stat(localPath);
+      console.log(`Trace file size: ${fileInfo.size} bytes`);
+
+      // Check if the file contains actual trace data
+      const fileContent = await Deno.readTextFile(localPath);
+      if (fileContent.includes("TRACE:") && fileContent.includes("TIMESTAMP") && fileContent.length > 1000) {
+        console.log("Trace file contains valid trace data");
+        return true;
+      } else {
+        console.warn("Warning: Trace file may not contain valid trace data");
+
+        // Try one more approach - use adb pull directly
+        console.log("Trying direct adb pull as fallback...");
+        const pullResult = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
+
+        if (pullResult.success) {
+          console.log("Successfully pulled trace file using direct adb pull");
+          return true;
         }
       }
 
-      if (bestAltFile) {
-        console.log(`Trying to pull alternative trace file: ${bestAltFile} (${largestSize} bytes)`);
-        config.deviceTracePath = bestAltFile;
-      } else {
-        console.error("Could not find a suitable alternative trace file");
-        return false;
-      }
-    } else {
-      console.error("No alternative trace files found");
-      return false;
-    }
-  } else {
-    // Check file size
-    const sizeCheck = await runCommand("adb", ["shell", `stat -c %s "${config.deviceTracePath}"`]);
-    if (sizeCheck.success) {
-      const size = parseInt(sizeCheck.stdout.trim(), 10);
-      console.log(`Trace file size: ${size} bytes`);
-
-      if (size < 1000) {
-        console.warn("Warning: Trace file is very small, may not contain valid data");
-      }
+      return fileInfo.size > 1000;
+    } catch (error) {
+      console.error(`Failed to write trace data to local file: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  // Try to pull the file
-  console.log(`Pulling trace file from ${config.deviceTracePath} to ${localPath}...`);
+  // If we get here, try the traditional pull method as a last resort
+  console.log("Trying traditional adb pull method...");
   const pullResult = await runCommand("adb", ["pull", config.deviceTracePath, localPath]);
 
-  if (!pullResult.success) {
-    console.error(`Failed to pull trace file: ${pullResult.stderr}`);
-
-    // Try an alternative approach - cat the file and redirect to local file
-    console.log("Trying alternative approach - using cat to retrieve file content...");
-    const catResult = await runCommand("adb", ["shell", `cat "${config.deviceTracePath}"`]);
-
-    if (catResult.success && catResult.stdout) {
-      console.log(`Retrieved ${catResult.stdout.length} bytes of trace data, writing to local file...`);
-      try {
-        await Deno.writeTextFile(localPath, catResult.stdout);
-        console.log("Successfully wrote trace data to local file");
-        return true;
-      } catch (error) {
-        console.error(`Failed to write trace data to local file: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      }
-    } else {
-      console.error("Failed to retrieve trace data using cat");
-      return false;
-    }
+  if (pullResult.success) {
+    console.log("Successfully pulled trace file");
+    return true;
   }
 
-  // Verify the pulled file
-  try {
-    const fileInfo = await Deno.stat(localPath);
-    console.log(`Successfully pulled trace file (${fileInfo.size} bytes)`);
-
-    if (fileInfo.size < 1000) {
-      console.warn("Warning: Pulled trace file is very small, may not contain valid data");
-    }
-
-    return fileInfo.size > 0;
-  } catch (error) {
-    console.error(`Error verifying pulled file: ${error instanceof Error ? error.message : String(error)}`);
-    return false;
-  }
+  console.error("All methods to pull the trace file failed");
+  return false;
 }
+
 async function getDeviceInfo(): Promise<Record<string, string>> {
   const info: Record<string, string> = {};
 
@@ -278,6 +314,7 @@ async function getDeviceInfo(): Promise<Record<string, string>> {
 
   return info;
 }
+
 async function processTraceData(
   traceFile: string,
   metricsFile: string,
@@ -443,6 +480,7 @@ async function processTraceData(
 
   return metrics;
 }
+
 async function writeMetricsToFile(
   metricsFile: string,
   metrics: Record<string, number>,
@@ -595,6 +633,7 @@ async function writeMetricsToFile(
   await Deno.writeTextFile(metricsFile, content);
   console.log(`Metrics saved to ${metricsFile}`);
 }
+
 async function runTestIteration(iteration: number, config: Config): Promise<boolean> {
   console.log(`\n=== Running test iteration ${iteration} ===`);
 
@@ -646,6 +685,7 @@ async function runTestIteration(iteration: number, config: Config): Promise<bool
 
   return true;
 }
+
 async function generateSummaryReport(config: Config): Promise<void> {
   console.log("Generating summary report...");
   const summaryFile = join(config.outputDir, "summary_report.txt");
@@ -767,6 +807,7 @@ async function generateSummaryReport(config: Config): Promise<void> {
   await Deno.writeTextFile(summaryFile, content);
   console.log(`Summary report saved to ${summaryFile}`);
 }
+
 async function loadEnvConfig(envPath: string = ".env"): Promise<Record<string, string>> {
   const config: Record<string, string> = {};
 
@@ -838,6 +879,7 @@ async function loadMarkersConfig(configPath: string = "markers.json"): Promise<{
     return defaultConfig;
   }
 }
+
 async function main() {
   console.log("===== React Native Performance Measurement Tool =====");
 
@@ -973,6 +1015,7 @@ async function main() {
   console.log("2. All times are measured from app launch (t=0)");
   console.log("3. View detailed metrics in the individual run files and summary in summary_report.txt");
 }
+
 if (import.meta.main) {
   try {
     await main();
