@@ -2,7 +2,7 @@
 
 import { parse as parseArgs } from "https://deno.land/std@0.224.0/flags/mod.ts";
 
-const PACKAGE_NAME = "com.bloomberg.android.plus";
+const PACKAGE_NAME = "com.example.app";
 
 interface PairedMarker {
   start: string;
@@ -260,7 +260,6 @@ async function processTraceData(
       }
     }
 
-
     if (!appStartTimestamp) {
       const appFirstMentionPattern = new RegExp(
         `\\S+\\s+\\(\\s*\\d+\\)\\s+\\[\\d+\\]\\s+\\.+\\s+([0-9.]+):\\s+.*${config.appPackage}`
@@ -273,7 +272,6 @@ async function processTraceData(
         );
       }
     }
-
 
     if (!appStartTimestamp) {
       const firstTimestampMatch = traceContent.match(
@@ -295,7 +293,6 @@ async function processTraceData(
       );
     }
 
-
     const createMatch = traceContent.match(
       /([0-9.]+).*performCreate.*?${config.appPackage}/
     );
@@ -315,7 +312,6 @@ async function processTraceData(
     if (resumeMatch)
       metrics.activityResumeTimestamp = parseFloat(resumeMatch[1]);
     if (drawnMatch) metrics.activityDrawnTimestamp = parseFloat(drawnMatch[1]);
-
 
     for (const marker of config.customMarkers) {
       const patterns = [
@@ -344,7 +340,6 @@ async function processTraceData(
         }
       }
     }
-
 
     for (const pair of config.pairedMarkers) {
       const startPatterns = [
@@ -406,7 +401,6 @@ async function processTraceData(
       }
     }
 
-
     if (appStartTimestamp) {
       if (metrics.activityCreateTimestamp) {
         metrics.timeToCreate =
@@ -446,18 +440,12 @@ async function processTraceData(
       }
     }
 
-
-
-
     const normalizeTimestamp = (timestamp: number): number => {
-
       if (timestamp > 1000000) {
-
         return parseFloat((timestamp / 1000000).toFixed(3));
       }
       return timestamp;
     };
-
 
     if (metrics.appStartTimestamp) {
       metrics.appStartTimestamp = normalizeTimestamp(metrics.appStartTimestamp);
@@ -487,7 +475,6 @@ async function processTraceData(
       );
     }
 
-
     for (const marker of config.customMarkers) {
       const timestampKey = `${marker}Timestamp`;
       const relativeTimeKey = `timeTo${marker}`;
@@ -497,13 +484,11 @@ async function processTraceData(
       }
 
       if (metrics[relativeTimeKey]) {
-
         metrics[relativeTimeKey] = parseFloat(
           metrics[relativeTimeKey].toFixed(3)
         );
       }
     }
-
 
     for (const pair of config.pairedMarkers) {
       const startTimestampKey = `${pair.start}Timestamp`;
@@ -523,7 +508,6 @@ async function processTraceData(
       }
 
       if (metrics[durationKey]) {
-
         metrics[durationKey] = parseFloat(metrics[durationKey].toFixed(3));
       }
 
@@ -539,7 +523,6 @@ async function processTraceData(
         );
       }
     }
-
 
     await writeMetricsToFile(metricsPath, metrics, config);
   } catch (error) {
@@ -644,7 +627,6 @@ async function writeMetricsToFile(
 
       content += `=== ${pair.name} ===\n`;
 
-
       if (startTimestamp) {
         content += `${pair.start}:\n`;
         content += `  - Absolute time: ${startTimestamp.toFixed(3)} seconds\n`;
@@ -658,7 +640,6 @@ async function writeMetricsToFile(
         content += `${pair.start}: Not found in trace\n`;
       }
 
-
       if (endTimestamp) {
         content += `${pair.end}:\n`;
         content += `  - Absolute time: ${endTimestamp.toFixed(3)} seconds\n`;
@@ -671,7 +652,6 @@ async function writeMetricsToFile(
       } else {
         content += `${pair.end}: Not found in trace\n`;
       }
-
 
       if (startTimestamp && endTimestamp) {
         const calculatedDuration = endTimestamp - startTimestamp;
@@ -703,7 +683,6 @@ async function runPerformanceTests(config: Config) {
   for (let i = 1; i <= config.iterations; i++) {
     console.log(`\n=== Running test iteration ${i} ===`);
 
-
     if (!config.warmMode) {
       if (!(await clearAppData(config.appPackage))) {
         console.error("Failed to clear app data. Skipping iteration.");
@@ -713,35 +692,29 @@ async function runPerformanceTests(config: Config) {
       console.log("Warm mode: Skipping app data clearing");
     }
 
-
     const traceStarted = await startTrace(config);
     if (!traceStarted) {
       console.error("Failed to start tracing. Skipping iteration.");
       continue;
     }
 
-
     console.log("Launching app...");
     const launchOutput = await launchApp(config);
     console.log(launchOutput);
-
 
     console.log(`Waiting for ${config.traceDuration} seconds...`);
     await new Promise((resolve) =>
       setTimeout(resolve, config.traceDuration * 1000)
     );
 
-
     const screenshotPath = `${config.outputDir}/screenshot_${i}.png`;
     await takeScreenshot(screenshotPath);
-
 
     const traceStopped = await stopTrace(config);
     if (!traceStopped) {
       console.error("Failed to stop tracing. Skipping iteration.");
       continue;
     }
-
 
     const localTracePath = `${config.outputDir}/trace_iteration_${i}.perfetto`;
     const tracePulled = await pullTraceFile(config, localTracePath);
@@ -750,7 +723,6 @@ async function runPerformanceTests(config: Config) {
       console.error("Failed to pull trace file. Skipping iteration.");
       continue;
     }
-
 
     await processTraceData(config, localTracePath, i);
   }
@@ -775,7 +747,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
   for (const file of metricsFiles) {
     try {
       const content = await Deno.readTextFile(file);
-
 
       for (const marker of config.customMarkers) {
         const markerTimeMatch = content.match(
@@ -804,9 +775,7 @@ async function generateSummaryReport(config: Config): Promise<void> {
         }
       }
 
-
       for (const pair of config.pairedMarkers) {
-
         const startTimeMatch = content.match(
           new RegExp(
             `${pair.start}:\\s*\\n\\s*- Absolute time: ([0-9.]+) seconds`
@@ -833,7 +802,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
           }
           allMetrics[`${pair.start}_relative`].push(startFromApp);
         }
-
 
         const endTimeMatch = content.match(
           new RegExp(
@@ -862,7 +830,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
           allMetrics[`${pair.end}_relative`].push(endFromApp);
         }
 
-
         const durationMatch = content.match(
           new RegExp(`Duration of ${pair.name}: ([0-9.]+) seconds`)
         );
@@ -874,7 +841,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
           allMetrics[`${pair.name}_duration`].push(duration);
         }
       }
-
 
       const createMatch = content.match(/Activity Create: ([0-9.]+) seconds/);
       const startMatch = content.match(/Activity Start: ([0-9.]+) seconds/);
@@ -993,7 +959,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
   for (const marker of config.customMarkers) {
     content += `=== ${marker} ===\n`;
 
-
     if (
       allMetrics[`${marker}_absolute`] &&
       allMetrics[`${marker}_absolute`].length > 0
@@ -1007,7 +972,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
     } else {
       content += "Absolute Time: Not found in traces\n\n";
     }
-
 
     if (
       allMetrics[`${marker}_relative`] &&
@@ -1028,7 +992,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
     content += "== Paired Markers ==\n";
     for (const pair of config.pairedMarkers) {
       content += `=== ${pair.name} ===\n`;
-
 
       content += `${pair.start}:\n`;
       if (
@@ -1059,7 +1022,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
         content += "  Time from App Start: Not found in traces\n\n";
       }
 
-
       content += `${pair.end}:\n`;
       if (
         allMetrics[`${pair.end}_absolute`] &&
@@ -1088,7 +1050,6 @@ async function generateSummaryReport(config: Config): Promise<void> {
       } else {
         content += "  Time from App Start: Not found in traces\n\n";
       }
-
 
       content += `Duration (${pair.end} - ${pair.start}):\n`;
       if (
@@ -1270,7 +1231,7 @@ async function main() {
   );
   const outputDir =
     args.output || envConfig.OUTPUT_DIR || "./performance_traces";
-  const deviceTracePath = "/data/local/tmp/trace.txt"script
+  const deviceTracePath = "/data/local/tmp/trace.txt";
   const markersConfigPath =
     args["markers-config"] || envConfig.MARKERS_CONFIG || "markers.json";
   const traceCategories =
