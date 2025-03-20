@@ -2,3 +2,4 @@ performance_traces/*
 .DS_Store
 *.sh
 .env*
+app_size_reports/*

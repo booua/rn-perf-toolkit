@@ -220,7 +220,7 @@ You can create multiple environment files for different apps or environments:
 deno run --allow-run --allow-read --allow-write measure_performance.ts --env .env.production
 
 # Use a specific environment file for a different app
-deno run --allow-run --allow-read --allow-write measure_performance.ts --env .env.bloomberg
+deno run --allow-run --allow-read --allow-write measure_performance.ts --env .env.test-app
 ```
 
 ### Using Different Markers Configuration Files
@@ -229,5 +229,5 @@ You can create multiple markers configuration files for different apps or scenar
 
 ```bash
 # Use a specific markers configuration file
-deno run --allow-run --allow-read --allow-write measure_performance.ts --markers-config markers.bloomberg.json
+deno run --allow-run --allow-read --allow-write measure_performance.ts --markers-config markers.testapp.json
 ```
