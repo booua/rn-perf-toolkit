@@ -1,31 +1,52 @@
 {
   "devices": [
     {
-      "avd_name": "MyPixelEmulator2",
+      "avd_name": "HighEndDevice",
+      "api_level": "34",
+      "package": "system-images;android-34;google_apis;arm64-v8a",
+      "device": "pixel",
+      "tag": "google_apis",
+      "abi": "arm64-v8a",
+      "ram": "12288",
+      "internal_storage": "8192M",
+      "sd_card_size": "512M",
+      "screen_resolution": "1280x2856",
+      "network_type": "lte",
+      "signal_strength": "moderate",
+      "battery_level": "65",
+      "battery_health": "good"
+    },
+    {
+      "avd_name": "MidEndDevice",
+      "api_level": "34",
+      "package": "system-images;android-34;google_apis;arm64-v8a",
+      "device": "pixel",
+      "tag": "google_apis",
+      "abi": "arm64-v8a",
+      "ram": "6144",
+      "internal_storage": "8192M",
+      "sd_card_size": "512M",
+      "screen_resolution": "1280x2856",
+      "network_type": "lte",
+      "signal_strength": "moderate",
+      "battery_level": "65",
+      "battery_health": "good"
+    },
+    {
+      "avd_name": "LowEndDevice",
       "api_level": "33",
       "package": "system-images;android-33;google_apis;arm64-v8a",
       "device": "pixel",
       "tag": "google_apis",
       "abi": "arm64-v8a",
-      "ram": "4096",
-      "internal_storage": "2048M",
-      "sd_card_size": "512M",
-      "screen_resolution": "1080x1920",
-      "network_type": "full",
-      "signal_strength": "max",
-      "battery_level": "100",
-      "battery_health": "good"
-    },
-    {
-      "avd_name": "MyPixelEmulator1",
-      "package": "system-images;android-33;google_apis;arm64-v8a",
-      "device": "pixel",
-      "tag": "google_apis",
-      "abi": "arm64-v8a",
       "ram": "2048",
-      "internal_storage": "1024M",
+      "internal_storage": "8192M",
       "sd_card_size": "512M",
-      "screen_resolution": "1080x1920"
+      "screen_resolution": "1280x2856",
+      "network_type": "lte",
+      "signal_strength": "moderate",
+      "battery_level": "65",
+      "battery_health": "good"
     }
   ]
 }
