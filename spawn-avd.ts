@@ -6,12 +6,13 @@ import { intro, outro, spinner } from "npm:@clack/prompts";
 import color from "npm:picocolors";
 
 const CONFIG_FILE = "avd_config.json";
-const installedPackages = new Set<string>(); // track installed system images
+const installedPackages = new Set<string>();
 
 interface DeviceConfig {
   avd_name: string;
   package: string;
   device: string;
+  api_level: string;
   tag?: string;
   abi?: string;
   ram?: string;
@@ -30,24 +31,138 @@ interface Config {
 
 const successfulCreations: string[] = [];
 
-async function runCommand(cmd: string, args: string[]) {
-  const proc = new Deno.Command(cmd, {
+async function runCommand(
+  cmd: string,
+  args: string[],
+  options: { acceptLicense?: boolean } = {}
+): Promise<string> {
+  const command = new Deno.Command(cmd, {
     args,
     stdout: "piped",
     stderr: "piped",
   });
-  const output = await proc.output();
-  if (!output.success) {
-    const stderr = new TextDecoder().decode(output.stderr);
-    throw new Error(`Error running "${cmd} ${args.join(" ")}":\n${stderr}`);
+
+  const { code, stdout, stderr } = await command.output();
+  const output = new TextDecoder().decode(stdout);
+  const error = new TextDecoder().decode(stderr);
+
+  if (code !== 0) {
+    throw new Error(`Command failed with code ${code}: ${error}`);
   }
-  return new TextDecoder().decode(output.stdout);
+
+  return output;
+}
+
+async function isPackageInstalled(pkg: string): Promise<boolean> {
+  try {
+    const output = await runCommand("sdkmanager", ["--list_installed"]);
+    return output.includes(pkg);
+  } catch (error) {
+    console.error(
+      color.red(`Error checking if package ${pkg} is installed: ${error}`)
+    );
+    return false;
+  }
+}
+
+async function acceptLicenses() {
+  try {
+    await runCommand("sdkmanager", ["--licenses"]);
+  } catch (error) {
+    console.warn(
+      color.yellow(
+        "Warning: Could not automatically accept licenses. You may need to accept them manually."
+      )
+    );
+  }
+}
+
+async function installPackage(pkg: string, description: string) {
+  const s = spinner();
+  if (installedPackages.has(pkg)) {
+    return;
+  }
+
+  s.start(`Checking if ${description} ${pkg} is installed...`);
+  const isInstalled = await isPackageInstalled(pkg);
+
+  if (!isInstalled) {
+    s.stop(`${description} ${pkg} not found. Installing...`);
+    try {
+      s.start(`Installing ${pkg}...`);
+
+      // Install package directly using sdkmanager
+      await runCommand("sdkmanager", [pkg]);
+
+      // Verify installation
+      const verifyInstalled = await isPackageInstalled(pkg);
+      if (!verifyInstalled) {
+        throw new Error(`Package ${pkg} installation verification failed`);
+      }
+
+      installedPackages.add(pkg);
+      s.stop(color.green(`Successfully installed ${pkg}`));
+    } catch (error) {
+      s.stop(color.red(`Failed to install ${pkg}`));
+      throw error;
+    }
+  } else {
+    installedPackages.add(pkg);
+    s.stop(color.green(`${description} ${pkg} is already installed`));
+  }
+}
+
+async function installRequiredPackages(config: Config) {
+  const s = spinner();
+  const requiredPlatforms = new Set<string>();
+  const requiredSystemImages = new Set<string>();
+
+  for (const device of config.devices) {
+    requiredPlatforms.add(`platforms;android-${device.api_level}`);
+    requiredSystemImages.add(device.package);
+  }
+
+  for (const platform of requiredPlatforms) {
+    try {
+      await installPackage(platform, "Platform SDK");
+    } catch (error) {
+      throw new Error(`Failed to install platform ${platform}: ${error}`);
+    }
+  }
+
+  for (const systemImage of requiredSystemImages) {
+    try {
+      await installPackage(systemImage, "System image");
+
+      const verifyOutput = await runCommand("sdkmanager", ["--list_installed"]);
+      if (!verifyOutput.includes(systemImage)) {
+        throw new Error(
+          `System image ${systemImage} installation could not be verified`
+        );
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to install system image ${systemImage}: ${error}`
+      );
+    }
+  }
+
+  try {
+    await installPackage("platform-tools", "Platform tools");
+    await installPackage("build-tools;34.0.0", "Build tools");
+  } catch (error) {
+    throw new Error(`Failed to install tools: ${error}`);
+  }
+
+  console.log(color.blue("\nInstalled packages:"));
+  const installedOutput = await runCommand("sdkmanager", ["--list_installed"]);
+  console.log(installedOutput);
 }
 
 function replaceOrAppend(
   content: string,
   pattern: RegExp,
-  newLine: string,
+  newLine: string
 ): string {
   const lines = content.split("\n");
   let replaced = false;
@@ -62,24 +177,6 @@ function replaceOrAppend(
     lines.push(newLine);
   }
   return lines.join("\n");
-}
-
-async function ensurePackageInstalled(pkg: string) {
-  if (installedPackages.has(pkg)) {
-    return;
-  }
-
-  const s = spinner();
-  s.start(`Installing system image (if needed): ${pkg}...`);
-
-  try {
-    await runCommand("sdkmanager", ["--install", pkg]);
-    installedPackages.add(pkg);
-    s.stop(color.green("Done installing image!"));
-  } catch (err) {
-    s.stop(color.red("Failed."));
-    throw err;
-  }
 }
 
 async function createAvd(deviceConfig: DeviceConfig) {
@@ -103,7 +200,12 @@ async function createAvd(deviceConfig: DeviceConfig) {
     throw new Error(`Missing required fields (avd_name, package, device).`);
   }
 
-  await ensurePackageInstalled(PACKAGE);
+  const verifyOutput = await runCommand("sdkmanager", ["--list_installed"]);
+  if (!verifyOutput.includes(PACKAGE)) {
+    throw new Error(
+      `Required system image ${PACKAGE} is not installed. Please check the installation.`
+    );
+  }
 
   const avdArgs = [
     "create",
@@ -126,12 +228,29 @@ async function createAvd(deviceConfig: DeviceConfig) {
 
   const s = spinner();
   s.start(`Creating AVD "${AVD_NAME}"...`);
+
   try {
+    const deviceListOutput = await runCommand("avdmanager", ["list", "device"]);
+    if (!deviceListOutput.includes(`"${DEVICE}"`)) {
+      throw new Error(
+        `Device "${DEVICE}" not found in available devices list. Please check the device name.`
+      );
+    }
+
     await runCommand("avdmanager", avdArgs);
     s.stop(color.green("Done creating AVD!"));
   } catch (err) {
     s.stop(color.red("Failed."));
     const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(color.yellow("Debug info:"));
+    console.error(color.yellow(`- Device: ${DEVICE}`));
+    console.error(color.yellow(`- Package: ${PACKAGE}`));
+    console.error(color.yellow(`- Command: avdmanager ${avdArgs.join(" ")}`));
+
+    console.error(color.yellow("\nAvailable system images:"));
+    const systemImages = await runCommand("sdkmanager", ["--list"]);
+    console.error(systemImages);
+
     throw new Error(`Error creating AVD "${AVD_NAME}":\n${errorMessage}`);
   }
 
@@ -154,21 +273,21 @@ async function createAvd(deviceConfig: DeviceConfig) {
       configContent = replaceOrAppend(
         configContent,
         /^hw\.ramSize=/,
-        `hw.ramSize=${RAM}`,
+        `hw.ramSize=${RAM}`
       );
     }
     if (INTERNAL_STORAGE) {
       configContent = replaceOrAppend(
         configContent,
         /^disk\.dataPartition\.size=/,
-        `disk.dataPartition.size=${INTERNAL_STORAGE}`,
+        `disk.dataPartition.size=${INTERNAL_STORAGE}`
       );
     }
     if (SD_CARD_SIZE) {
       configContent = replaceOrAppend(
         configContent,
         /^sdcard\.size=/,
-        `sdcard.size=${SD_CARD_SIZE}`,
+        `sdcard.size=${SD_CARD_SIZE}`
       );
     }
     if (SCREEN_RESOLUTION) {
@@ -177,12 +296,12 @@ async function createAvd(deviceConfig: DeviceConfig) {
         configContent = replaceOrAppend(
           configContent,
           /^hw\.lcd\.width=/,
-          `hw.lcd.width=${width}`,
+          `hw.lcd.width=${width}`
         );
         configContent = replaceOrAppend(
           configContent,
           /^hw\.lcd\.height=/,
-          `hw.lcd.height=${height}`,
+          `hw.lcd.height=${height}`
         );
       }
     }
@@ -190,28 +309,28 @@ async function createAvd(deviceConfig: DeviceConfig) {
       configContent = replaceOrAppend(
         configContent,
         /^hw\.network=/,
-        `hw.network=${NETWORK_TYPE}`,
+        `hw.network=${NETWORK_TYPE}`
       );
     }
     if (SIGNAL_STRENGTH) {
       configContent = replaceOrAppend(
         configContent,
         /^hw\.network\.signalStrength=/,
-        `hw.network.signalStrength=${SIGNAL_STRENGTH}`,
+        `hw.network.signalStrength=${SIGNAL_STRENGTH}`
       );
     }
     if (BATTERY_LEVEL) {
       configContent = replaceOrAppend(
         configContent,
         /^battery\.level=/,
-        `battery.level=${BATTERY_LEVEL}`,
+        `battery.level=${BATTERY_LEVEL}`
       );
     }
     if (BATTERY_HEALTH) {
       configContent = replaceOrAppend(
         configContent,
         /^battery\.health=/,
-        `battery.health=${BATTERY_HEALTH}`,
+        `battery.health=${BATTERY_HEALTH}`
       );
     }
 
@@ -223,13 +342,11 @@ async function createAvd(deviceConfig: DeviceConfig) {
     throw new Error(`Error customizing AVD config:\n${errorMessage}`);
   }
   successfulCreations.push(AVD_NAME);
-
 }
 
 async function main() {
   intro(color.cyan("Create AVD Script"));
 
-  // 1. Check if avdmanager/sdkmanager are on PATH
   try {
     await runCommand("which", ["sdkmanager"]);
   } catch {
@@ -260,10 +377,21 @@ async function main() {
 
   if (!config.devices || !Array.isArray(config.devices)) {
     console.error(
-      color.red(`Missing or invalid "devices" array in ${CONFIG_FILE}.`),
+      color.red(`Missing or invalid "devices" array in ${CONFIG_FILE}.`)
     );
     Deno.exit(1);
   }
+
+  try {
+    await installRequiredPackages(config);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(
+      color.red(`Failed to install required packages: ${errorMessage}`)
+    );
+    Deno.exit(1);
+  }
+
   const deviceCount = config.devices.length;
   console.log(color.bold(`Found ${deviceCount} device(s) in ${CONFIG_FILE}.`));
 
@@ -271,15 +399,15 @@ async function main() {
     const deviceCfg = config.devices[i];
     console.log(
       color.blue(
-        `\nProcessing device ${i + 1} of ${deviceCount}: ${deviceCfg.avd_name}`,
-      ),
+        `\nProcessing device ${i + 1} of ${deviceCount}: ${deviceCfg.avd_name}`
+      )
     );
     try {
       await createAvd(deviceCfg);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error(
-        color.red(`Failed to create device ${i + 1}: ${errorMessage}`),
+        color.red(`Failed to create device ${i + 1}: ${errorMessage}`)
       );
       Deno.exit(1);
     }
@@ -294,8 +422,8 @@ async function main() {
 
   outro(
     color.green(
-      `Created ${successfulCreations.length}/${deviceCount} AVDs successfully!`,
-    ),
+      `Created ${successfulCreations.length}/${deviceCount} AVDs successfully!`
+    )
   );
   Deno.exit(0);
 }

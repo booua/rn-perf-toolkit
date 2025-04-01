@@ -221,6 +221,15 @@ async function processTraceData(
 
     let appStartTimestamp = 0;
     const appStartPatterns = [
+      // First try to find Startup trace
+      new RegExp(
+        `\\S+\\s+\\(\\s*\\d+\\)\\s+\\[\\d+\\]\\s+\\.+\\s+([0-9.]+):\\s+tracing_mark_write:\\s+B\\|\\d+\\|Startup`
+      ),
+      // Then try APPLICATION_START
+      new RegExp(
+        `\\S+\\s+\\(\\s*\\d+\\)\\s+\\[\\d+\\]\\s+\\.+\\s+([0-9.]+):\\s+tracing_mark_write:.*APPLICATION_START`
+      ),
+      // Fallback to other patterns
       new RegExp(
         `\\S+\\s+\\(\\s*\\d+\\)\\s+\\[\\d+\\]\\s+\\.+\\s+([0-9.]+):\\s+tracing_mark_write:.*ActivityManager.*START.*?${config.appPackage}`
       ),
@@ -239,7 +248,6 @@ async function processTraceData(
       new RegExp(
         `\\S+\\s+\\(\\s*\\d+\\)\\s+\\[\\d+\\]\\s+\\.+\\s+([0-9.]+):\\s+tracing_mark_write:.*am_proc_start.*?${config.appPackage}`
       ),
-
       /([0-9.]+).*ActivityManager.*START.*?${config.appPackage}/,
       /([0-9.]+).*ActivityTaskManager.*START.*?${config.appPackage}/,
       /([0-9.]+).*ActivityManager.*Displayed.*?${config.appPackage}/,

@@ -20,7 +20,9 @@ declare const Deno: {
   readDir(
     path: string
   ): AsyncIterable<{ name: string; isFile: boolean; isDirectory: boolean }>;
-  stat(path: string): Promise<{ size: number; isFile: boolean }>;
+  stat(
+    path: string
+  ): Promise<{ size: number; isFile: boolean; isDirectory: boolean }>;
   open(path: string): Promise<{
     read(buffer: Uint8Array): Promise<number | null>;
     close(): void;
@@ -42,7 +44,7 @@ interface ImportMeta {
 
 import { parse as parseArgs } from "https://deno.land/std@0.224.0/flags/mod.ts";
 
-const PACKAGE_NAME = "com.example.app";
+const DEFAULT_PACKAGE_NAME = "app.example.com";
 
 interface Config {
   appPackage: string;
@@ -52,6 +54,7 @@ interface Config {
   deepSearch: boolean;
   analyzeLoaders: boolean;
   detectEncryption: boolean;
+  buildType: "development" | "production";
 }
 
 interface BundleInfo {
@@ -81,7 +84,13 @@ interface AppSizeMetrics {
   componentsBreakdown?: Record<string, number>;
   architectureBreakdown?: Record<string, number>;
   bundleLoadingMechanism?: {
-    type: "direct" | "custom" | "encrypted" | "split" | "unknown";
+    type:
+      | "direct"
+      | "custom"
+      | "encrypted"
+      | "split"
+      | "unknown"
+      | "development";
     loaderFiles?: string[];
     encryptedFiles?: string[];
   };
@@ -98,6 +107,7 @@ interface AppSizeMetrics {
     codePath?: string;
     resourcePath?: string;
   };
+  isDevelopmentBuild?: boolean;
 }
 
 async function runCommand(
@@ -178,45 +188,68 @@ async function getInstalledAppSize(
 ): Promise<void> {
   const methods = [
     async () => {
-      const { success, stdout } = await runCommand("adb", [
-        "shell",
-        "du",
-        "-s",
-        `/data/data/${config.appPackage}`,
-      ]);
-      if (success) {
-        const size = parseInt(stdout.trim().split(/\s+/)[0], 10);
-        if (!isNaN(size)) return size * 1024;
-      }
-      return 0;
-    },
-    async () => {
+      // Try to get APK path and size first
       const { success, stdout } = await runCommand("adb", [
         "shell",
         "pm",
-        "get-app-size",
+        "path",
         config.appPackage,
       ]);
-      if (success) {
-        const match = stdout.match(/Total size:\s+(\d+)/);
-        if (match && match[1]) return parseInt(match[1], 10);
+      if (success && stdout) {
+        const apkPath = stdout.trim().replace("package:", "");
+        if (apkPath) {
+          const sizeResult = await runCommand("adb", [
+            "shell",
+            "ls",
+            "-l",
+            apkPath,
+          ]);
+          if (sizeResult.success) {
+            const match = sizeResult.stdout.match(
+              /\s(\d+)\s+\d{4}-\d{2}-\d{2}/
+            );
+            if (match && match[1]) {
+              return parseInt(match[1], 10);
+            }
+          }
+        }
       }
       return 0;
     },
     async () => {
-      const paths = await getAppPaths(config.appPackage);
+      // Try to get app data size using dumpsys
+      const paths = (await getAppPaths(config.appPackage)) || {};
       metrics.appPaths = paths;
-      if (!paths?.dataDir) return 0;
 
+      if (paths && paths.dataDir) {
+        const { success, stdout } = await runCommand("adb", [
+          "shell",
+          "du",
+          "-s",
+          paths.dataDir,
+        ]);
+        if (success) {
+          const size = parseInt(stdout.trim().split(/\s+/)[0], 10);
+          if (!isNaN(size)) {
+            return size * 1024; // Convert from KB to bytes
+          }
+        }
+      }
+      return 0;
+    },
+    async () => {
+      // Try dumpsys package info
       const { success, stdout } = await runCommand("adb", [
         "shell",
-        "du",
-        "-s",
-        paths.dataDir,
+        "dumpsys",
+        "package",
+        config.appPackage,
       ]);
-      if (success) {
-        const size = parseInt(stdout.trim().split(/\s+/)[0], 10);
-        if (!isNaN(size)) return size * 1024;
+      if (success && stdout) {
+        const sizeMatch = stdout.match(/codeSize=(\d+)/);
+        if (sizeMatch && sizeMatch[1]) {
+          return parseInt(sizeMatch[1], 10);
+        }
       }
       return 0;
     },
@@ -244,6 +277,10 @@ async function findBundleFiles(
     { pattern: /index\.(android|ios)/i, type: "bundle" as const },
     { pattern: /main\.(jsbundle|bundle)/i, type: "bundle" as const },
     { pattern: /(js_receiver|bridge|loader)\.js$/i, type: "loader" as const },
+    // Add more specific patterns for React Native bundles
+    { pattern: /assets\/index\.android\.bundle$/i, type: "bundle" as const },
+    { pattern: /assets\/index\.android\.js$/i, type: "bundle" as const },
+    { pattern: /assets\/index\.android$/i, type: "bundle" as const },
   ];
 
   const MAGIC_NUMBERS = {
@@ -305,7 +342,34 @@ async function findBundleFiles(
     }, 0);
   }
 
+  // Check for development build indicators
+  const devIndicators = [
+    /dev\.properties$/i,
+    /dev\.settings$/i,
+    /dev\.config$/i,
+    /development\.properties$/i,
+    /development\.settings$/i,
+    /development\.config$/i,
+  ];
+
   try {
+    // First check if this is a development build
+    for await (const entry of Deno.readDir(dir)) {
+      if (
+        entry.isFile &&
+        devIndicators.some((pattern) => pattern.test(entry.name))
+      ) {
+        metrics.isDevelopmentBuild = true;
+        metrics.bundleLoadingMechanism = {
+          type: "development",
+          loaderFiles: [],
+          encryptedFiles: [],
+        };
+        return; // Skip further bundle search for development builds
+      }
+    }
+
+    // If not a development build, proceed with normal bundle search
     if (!metrics.bundleLoadingMechanism) {
       metrics.bundleLoadingMechanism = {
         type: "unknown",
@@ -314,42 +378,93 @@ async function findBundleFiles(
       };
     }
 
-    for await (const entry of Deno.readDir(dir)) {
-      const path = `${dir}/${entry.name}`;
+    // Check common bundle locations
+    const bundleLocations = [
+      `${dir}/assets`,
+      `${dir}/assets/assets`,
+      `${dir}/assets/index.android.bundle`,
+      `${dir}/assets/index.android.js`,
+      `${dir}/assets/main.jsbundle`,
+      dir,
+    ];
 
-      if (entry.isFile) {
-        const matchedPattern = bundlePatterns.find(({ pattern }) =>
-          pattern.test(entry.name)
-        );
+    for (const location of bundleLocations) {
+      try {
+        const stat = await Deno.stat(location);
 
-        if (matchedPattern) {
-          const fileInfo = await Deno.stat(path);
-          const { type, isEncrypted } = await checkFileType(path);
+        if (stat.isFile) {
+          // If it's a file, check if it's a bundle
+          const matchedPattern = bundlePatterns.find(({ pattern }) =>
+            pattern.test(location)
+          );
 
-          if (!metrics.bundleFiles) metrics.bundleFiles = {};
+          if (matchedPattern) {
+            const { type, isEncrypted } = await checkFileType(location);
 
-          metrics.bundleFiles[entry.name] = {
-            size: fileInfo.size,
-            path,
-            type: type || matchedPattern.type,
-            isEncrypted,
-            isLoader: type === "loader" || matchedPattern.type === "loader",
-          };
+            if (!metrics.bundleFiles) metrics.bundleFiles = {};
 
-          metrics.bundleSize = (metrics.bundleSize || 0) + fileInfo.size;
+            const name = location.split("/").pop() || "";
+            metrics.bundleFiles[name] = {
+              size: stat.size,
+              path: location,
+              type: type || matchedPattern.type,
+              isEncrypted,
+              isLoader: type === "loader" || matchedPattern.type === "loader",
+            };
 
-          // Update bundle loading mechanism info
-          if (isEncrypted) {
-            metrics.bundleLoadingMechanism.type = "encrypted";
-            metrics.bundleLoadingMechanism.encryptedFiles?.push(entry.name);
+            metrics.bundleSize = (metrics.bundleSize || 0) + stat.size;
+
+            if (isEncrypted) {
+              metrics.bundleLoadingMechanism.type = "encrypted";
+              metrics.bundleLoadingMechanism.encryptedFiles?.push(name);
+            }
+            if (type === "loader" || matchedPattern.type === "loader") {
+              metrics.bundleLoadingMechanism.type = "custom";
+              metrics.bundleLoadingMechanism.loaderFiles?.push(name);
+            }
           }
-          if (type === "loader" || matchedPattern.type === "loader") {
-            metrics.bundleLoadingMechanism.type = "custom";
-            metrics.bundleLoadingMechanism.loaderFiles?.push(entry.name);
+        } else if (stat.isDirectory) {
+          // If it's a directory, scan for bundle files
+          for await (const entry of Deno.readDir(location)) {
+            if (entry.isFile) {
+              const path = `${location}/${entry.name}`;
+              const matchedPattern = bundlePatterns.find(({ pattern }) =>
+                pattern.test(entry.name)
+              );
+
+              if (matchedPattern) {
+                const fileInfo = await Deno.stat(path);
+                const { type, isEncrypted } = await checkFileType(path);
+
+                if (!metrics.bundleFiles) metrics.bundleFiles = {};
+
+                metrics.bundleFiles[entry.name] = {
+                  size: fileInfo.size,
+                  path,
+                  type: type || matchedPattern.type,
+                  isEncrypted,
+                  isLoader:
+                    type === "loader" || matchedPattern.type === "loader",
+                };
+
+                metrics.bundleSize = (metrics.bundleSize || 0) + fileInfo.size;
+
+                if (isEncrypted) {
+                  metrics.bundleLoadingMechanism.type = "encrypted";
+                  metrics.bundleLoadingMechanism.encryptedFiles?.push(
+                    entry.name
+                  );
+                }
+                if (type === "loader" || matchedPattern.type === "loader") {
+                  metrics.bundleLoadingMechanism.type = "custom";
+                  metrics.bundleLoadingMechanism.loaderFiles?.push(entry.name);
+                }
+              }
+            }
           }
         }
-      } else if (entry.isDirectory) {
-        await findBundleFiles(path, metrics);
+      } catch (error) {
+        // Ignore errors for locations that don't exist
       }
     }
 
@@ -532,12 +647,22 @@ async function writeReport(
   const sections: string[] = [
     `Android App Size Report (${metrics.timestamp})`,
     `Package: ${config.appPackage}`,
+    `Build Type: ${config.buildType}`,
     "",
     `Download Size: ${formatSize(metrics.downloadSize)}`,
     metrics.installedAppSize > 0
       ? `Installed Size: ${formatSize(metrics.installedAppSize)}`
       : "Installed Size: Permission denied",
   ];
+
+  if (metrics.isDevelopmentBuild) {
+    sections.push(
+      formatSection(
+        "Development Build Info",
+        "This is a development build. The JavaScript bundle is served from Metro bundler and not included in the APK."
+      )
+    );
+  }
 
   if (metrics.bundleFiles) {
     const bundleSection = [
@@ -746,13 +871,14 @@ Options:
   --deep-search    Enable deep search for bundles and loaders
   --analyze-loaders Enable analysis of custom bundle loaders
   --detect-encryption Enable detection of encrypted bundles
+  --build-type     Build type to measure (development|production) (default: development)
   -h, --help       Show this help message
 `);
 }
 
 async function main() {
   const args = parseArgs(Deno.args, {
-    string: ["package", "output"],
+    string: ["package", "output", "build-type"],
     boolean: [
       "verbose",
       "hermes",
@@ -782,7 +908,17 @@ async function main() {
     deepSearch: args["deep-search"] || false,
     analyzeLoaders: args["analyze-loaders"] || false,
     detectEncryption: args["detect-encryption"] || false,
+    buildType:
+      (args["build-type"] as "development" | "production") || "development",
   };
+
+  // Validate build type
+  if (config.buildType !== "development" && config.buildType !== "production") {
+    console.error(
+      "Invalid build type. Must be either 'development' or 'production'"
+    );
+    Deno.exit(1);
+  }
 
   try {
     await Deno.mkdir(config.outputDir, { recursive: true });
@@ -814,6 +950,9 @@ async function main() {
     console.error("Failed to gather app size metrics.");
     Deno.exit(1);
   }
+
+  // Set build type in metrics
+  metrics.isDevelopmentBuild = config.buildType === "development";
 
   await writeReport(config, metrics);
 

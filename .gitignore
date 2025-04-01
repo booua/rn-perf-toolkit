@@ -3,3 +3,4 @@ performance_traces/*
 *.sh
 .env*
 app_size_reports/*
+android_sdk_libs/*

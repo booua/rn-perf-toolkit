@@ -4,7 +4,13 @@
     "app_js_initialized",
     "first_screen_mounted",
     "js_bundle_load_start",
-    "js_bundle_load_end"
+    "js_bundle_load_end",
+    "newsfeed_load_start",
+    "newsfeed_load_end",
+    "newsfeed_data_process_start",
+    "newsfeed_data_process_end",
+    "article_load_start",
+    "article_load_end"
   ],
   "pairedMarkers": [
     {
@@ -13,14 +19,19 @@
       "name": "screen_transition"
     },
     {
-      "start": "trace_api_call_start",
-      "end": "trace_api_call_end",
-      "name": "api_call"
+      "start": "article_load_start",
+      "end": "article_load_end",
+      "name": "article_load"
     },
     {
-      "start": "trace_render_start",
-      "end": "trace_render_end",
-      "name": "component_render"
+      "start": "newsfeed_load_start",
+      "end": "newsfeed_load_end",
+      "name": "newsfeed_load"
+    },
+    {
+      "start": "newsfeed_data_process_start",
+      "end": "newsfeed_data_process_end",
+      "name": "newsfeed_data_process"
     }
   ]
 }
